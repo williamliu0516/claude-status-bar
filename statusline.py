@@ -80,7 +80,6 @@ LOCK_STALE = 120.0
 WINDOW_TOLERANCE = 120.0
 MAX_WINDOW = 8 * 86400
 WINDOWS = ("five_hour", "seven_day")
-GROUPS = {"five_hour": "session", "seven_day": "weekly"}
 
 RESET = "\033[0m"
 DIM = "\033[2m"
@@ -101,13 +100,13 @@ def normalize(entry):
     """Accept any of the source shapes and return {used_percentage, resets_at}, or None.
 
     Header-derived payloads carry `used_percentage` and epoch seconds; the usage endpoint
-    and ~/.claude.json carry `utilization` and an ISO 8601 string; entries inside `limits`
-    carry `percent`. This validates shape only -- whether the window is still running is
-    `plausible`'s question, and the two callers want different answers.
+    and ~/.claude.json carry `utilization` and an ISO 8601 string. This validates shape
+    only -- whether the window is still running is `plausible`'s question, and the two
+    callers want different answers.
     """
     if not isinstance(entry, dict):
         return None
-    pct = entry.get("used_percentage", entry.get("utilization", entry.get("percent")))
+    pct = entry.get("used_percentage", entry.get("utilization"))
     resets = entry.get("resets_at")
     if not isinstance(pct, (int, float)) or isinstance(pct, bool):
         return None
@@ -157,24 +156,6 @@ def merge(entries, now):
         "used_percentage": max(e["used_percentage"] for e in current),
         "resets_at": newest,
     }
-
-
-def scoped_limits(utilization):
-    """One pseudo-source per entry of the account cache's `limits` list.
-
-    `limits` carries constraints the flat `five_hour`/`seven_day` keys do not. A
-    model-scoped weekly cap sits there at 75% with severity `warning` while `seven_day`
-    still reads 70% -- the scoped one is what actually stops work, so folding it in through
-    the same take-the-largest rule keeps the bar showing the limit you will hit first.
-    """
-    rows = []
-    for item in utilization.get("limits") or []:
-        if not isinstance(item, dict):
-            continue
-        for name, group in GROUPS.items():
-            if item.get("group") == group:
-                rows.append({name: item})
-    return rows
 
 
 # ----------------------------------------------------------------------------- store
@@ -272,7 +253,7 @@ def poll():
         )
         with urllib.request.urlopen(request, timeout=8) as response:
             fresh = json.load(response)
-        cache = blend_into_cache(read_json(CACHE_PATH), [fresh] + scoped_limits(fresh), now)
+        cache = blend_into_cache(read_json(CACHE_PATH), [fresh], now)
         cache["polled_at"] = now
         cache.pop("retry_after", None)
         write_cache(cache)
@@ -287,7 +268,10 @@ def poll():
             headers = getattr(error, "headers", None)
             retry_after = headers.get("retry-after") if headers else None
             if retry_after and retry_after.strip().isdigit():
-                backoff = float(retry_after.strip())
+                # A floor, never a replacement. This endpoint answers `Retry-After: 0`,
+                # which taken literally would cancel the backoff entirely and leave us
+                # asking again at every poll interval for as long as it keeps refusing.
+                backoff = max(backoff, float(retry_after.strip()))
         cache = read_json(CACHE_PATH)
         cache["polled_at"] = now
         cache["retry_after"] = now + backoff
@@ -511,7 +495,7 @@ def main():
     now = time.time()
     cache = read_json(CACHE_PATH)
     utilization = sub_dict(sub_dict(read_json(CONFIG_PATH), "cachedUsageUtilization"), "utilization")
-    contributions = [sub_dict(payload, "rate_limits"), utilization] + scoped_limits(utilization)
+    contributions = [sub_dict(payload, "rate_limits"), utilization]
 
     merged = blend_into_cache(cache, contributions, now)
     if merged != cache:

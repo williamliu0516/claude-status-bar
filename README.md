@@ -84,9 +84,11 @@ Two details that are easy to get wrong:
   at its own sub-second precision, so the same window arrives as `…800.997`, `…800.225` and
   `…800.027`. Exact grouping reads that drift as three different windows, keeps one
   observation, and freezes the number.
-- **The weekly figure folds in `limits[]`.** A model-scoped weekly cap can sit at 75% with
-  severity `warning` while the flat `seven_day` key still reads 70%. The scoped one is what
-  actually stops your work, so the bar shows the limit you will hit first.
+- **The `limits[]` array is deliberately ignored.** It carries a second weekly figure — a
+  model-scoped cap that can read 75% while the flat `seven_day` key reads 70% — but the two
+  have *different denominators*. Combining them produces a number that matches neither, and
+  disagrees with what `/usage` reports. `5h` and `wk` are exactly `five_hour` and
+  `seven_day`, nothing else, so the bar and `/usage` always tell the same story.
 
 ## Why it runs every second
 
