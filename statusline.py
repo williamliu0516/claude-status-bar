@@ -183,9 +183,21 @@ def scoped_limits(utilization):
 def read_json(path):
     try:
         with open(path) as handle:
-            return json.load(handle)
+            data = json.load(handle)
     except (OSError, ValueError):
         return {}
+    return data if isinstance(data, dict) else {}
+
+
+def sub_dict(mapping, key):
+    """`mapping[key]` when it is a dict, else {}.
+
+    ~/.claude.json is a large file maintained by Claude Code and freely edited by hand, so
+    a key holding a list or a null instead of an object is a real possibility -- and an
+    AttributeError here blanks the whole status line.
+    """
+    value = mapping.get(key)
+    return value if isinstance(value, dict) else {}
 
 
 def write_cache(data):
@@ -498,20 +510,19 @@ def main():
 
     now = time.time()
     cache = read_json(CACHE_PATH)
-    utilization = (read_json(CONFIG_PATH).get("cachedUsageUtilization") or {}).get(
-        "utilization"
-    ) or {}
-    contributions = [payload.get("rate_limits") or {}, utilization] + scoped_limits(utilization)
+    utilization = sub_dict(sub_dict(read_json(CONFIG_PATH), "cachedUsageUtilization"), "utilization")
+    contributions = [sub_dict(payload, "rate_limits"), utilization] + scoped_limits(utilization)
 
     merged = blend_into_cache(cache, contributions, now)
     if merged != cache:
         write_cache(merged)
     spawn_poll(merged, now)
 
-    workspace = payload.get("workspace") or {}
-    cwd = (workspace.get("current_dir") or payload.get("cwd") or os.getcwd()).rstrip("/")
-    model = (payload.get("model") or {}).get("display_name") or "?"
-    effort = (payload.get("effort") or {}).get("level")
+    cwd = sub_dict(payload, "workspace").get("current_dir") or payload.get("cwd") or os.getcwd()
+    cwd = cwd.rstrip("/") if isinstance(cwd, str) else os.getcwd()
+    model = sub_dict(payload, "model").get("display_name")
+    model = model if isinstance(model, str) and model else "?"
+    effort = sub_dict(payload, "effort").get("level")
 
     model_cell = f"{BLUE}{short_model(model)}{RESET}"
     if effort:

@@ -20,6 +20,11 @@ open a new session, or restart an existing one, to pick it up.
 
 Needs `python3` (3.8+) and `curl` or `wget`. No packages, no virtualenv, nothing to build.
 
+The installer tries `xiaweiliu.com` first and falls back to `raw.githubusercontent.com`, so
+it works whether or not GitHub Pages is serving the custom domain. It refuses to install
+anything whose first line is not the expected shebang, which is what a captive portal or a
+login redirect would return with a 200.
+
 <details>
 <summary>Install straight from GitHub instead</summary>
 
