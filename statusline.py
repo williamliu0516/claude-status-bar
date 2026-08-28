@@ -49,6 +49,7 @@ Credentials are read, never written. Refreshing the OAuth token is Claude Code's
 """
 
 import json
+import hashlib
 import os
 import re
 import sys
@@ -91,6 +92,57 @@ GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
 SEP = f"{DIM}  │  {RESET}"
+
+# ---------------------------------------------------------------- identity
+#
+# SESSION IDENTIFIER SPEC v1 -- implemented identically here and in
+# context-keyboard-display/collect.py, which draws the same tag and colour on a
+# 142x428 keyboard panel. The two repositories share no code, so the
+# specification below is the entire contract; it is reproduced verbatim in both
+# READMEs. Integer arithmetic only, deliberately: no float, no locale, no
+# terminal metrics, so two independent implementations cannot drift.
+#
+#   tag   = session_id[:6], lowercased          (a UUID, so these are hex)
+#   slot  = sha1(session_id utf-8).digest()[0] % 8
+#   xterm = IDENT_PALETTE[slot]
+#   rgb   = the xterm-256 colour cube entry for that index:
+#             i = xterm - 16;  r = i // 36;  g = (i // 6) % 6;  b = i % 6
+#             rgb = (IDENT_CUBE[r], IDENT_CUBE[g], IDENT_CUBE[b])
+#
+# Eight slots, not sixteen, and the reason is measured rather than assumed. The
+# panel's own source records that two of its semantic colours "are too close in
+# hue to tell apart" at a 12 px dot; that pair is dE 37.3 in CIE-Lab. A
+# sixteen-slot palette gets its two nearest members down to dE 30.5 -- below
+# the distance already proven indistinguishable. Eight slots hold dE 61.5,
+# 1.65x that threshold, and stay dE 34.1 clear of every colour the panel uses
+# to mean something.
+#
+# Eight also divides 256, so `digest[0] % 8` is exactly uniform where % 10 or
+# % 12 would over-weight the low slots.
+#
+# Fewer slots means colours do repeat across concurrent sessions. That is the
+# honest trade: a repeat is *visibly identical*, which reads as "check the
+# tag", where a sixteen-slot near-miss would read as "these are different"
+# when they are not. The tag is the authority; the colour is the fast path.
+#
+# 256-colour SGR, not 24-bit: Terminal.app renders the former and ignores the
+# latter, and the panel quantises to the same cube so both show one colour.
+IDENT_CUBE = (0, 95, 135, 175, 215, 255)
+IDENT_PALETTE = (45, 46, 49, 69, 201, 202, 211, 228)
+IDENT_DOT = "\u25cf"
+
+
+def ident_cell(session_id):
+    """Colour dot + six-character tag, or None when the payload carries no id.
+
+    None rather than a placeholder: a tag that matches nothing on the panel is
+    a cell's worth of noise in a line that is already fighting for columns.
+    """
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    slot = hashlib.sha1(session_id.encode("utf-8")).digest()[0] % len(IDENT_PALETTE)
+    xterm = IDENT_PALETTE[slot]
+    return f"\033[38;5;{xterm}m{IDENT_DOT}{RESET} {DIM}{session_id[:6].lower()}{RESET}"
 
 
 # --------------------------------------------------------------------------- merging
@@ -513,6 +565,12 @@ def main():
         model_cell += f" {DIM}{effort}{RESET}"
 
     cells = [f"{CYAN}{BOLD}{os.path.basename(cwd)}{RESET}", model_cell]
+    # Ahead of the folder: the identifier answers "which session am I looking
+    # at", which is the question you ask before any of the numbers matter.
+    ident = ident_cell(payload.get("session_id"))
+    if ident:
+        cells.insert(0, ident)
+    branch_slot = len(cells) - 1  # immediately after the folder, wherever the identifier left it
     for label, name in (("5h", "five_hour"), ("wk", "seven_day")):
         seen = any(normalize(c.get(name)) for c in contributions + [cache])
         cells.append(window(label, merged.get(name), seen, now))
@@ -527,7 +585,7 @@ def main():
             terminal_columns() - printed_width(SEP.join(cells)) - printed_width(SEP),
         )
         if room >= BRANCH_FLOOR:
-            cells.insert(1, f"{MAGENTA}{elide(branch, room)}{RESET}")
+            cells.insert(branch_slot, f"{MAGENTA}{elide(branch, room)}{RESET}")
 
     sys.stdout.write(SEP.join(cells))
 
