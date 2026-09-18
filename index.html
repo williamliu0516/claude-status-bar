@@ -375,6 +375,10 @@ dl.spec dd {
   border-top: 1px solid var(--line);
   font-size: var(--fs-sm);
 }
+
+.foot small {
+  margin-bottom: var(--s3);
+}
 </style>
 </head>
 <body>
@@ -386,12 +390,26 @@ dl.spec dd {
        that are actually correct.</p>
   </header>
 
+  <dl class="spec">
+    <dt>session</dt><dd>a coloured dot and six characters, so you can tell sessions apart &mdash;
+      the same mark <a href="https://xiaweiliu.com/keyboard-display/">keyboard-display</a> draws
+      on its panel</dd>
+    <dt>where</dt><dd>folder and git branch; the branch gives way first on a narrow terminal</dd>
+    <dt>model</dt><dd>model and effort level</dd>
+    <dt>5h&nbsp;/&nbsp;wk</dt><dd>usage bars with time until reset, kept current across every
+      open session instead of each one's stale snapshot</dd>
+  </dl>
+
   <div class="cmd">
     <div class="cmd-head"><span>install</span><span>sh</span></div>
     <pre><code><span class="sigil">$</span>curl -fsSL https://xiaweiliu.com/claude-status-bar/install.sh | sh</code></pre>
   </div>
+  <p class="note">Needs only python3 3.8+. Leaves your other settings alone; run it again to upgrade.</p>
 
   <footer class="foot">
+    <small>Linux and macOS. On macOS Claude Code keeps its login in the Keychain, so the
+       background usage refresh is skipped there and the bars update from your sessions
+       instead.</small>
     <a class="quiet" href="https://github.com/williamliu0516/claude-status-bar">Source and documentation
        on GitHub</a>
   </footer>
