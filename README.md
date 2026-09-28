@@ -130,6 +130,23 @@ They are merged by a rule that needs no trust in write order or clock skew:
 
 A stale snapshot can therefore neither pull the number backwards nor revive a dead window.
 
+### Switching accounts
+
+That same rule would make a previous login's figures permanent: whichever account read
+higher, or has the later boundary, wins until its window ends — a week, for `wk`. So every
+observation is attributed to an account:
+
+- The shared cache is stamped with `oauthAccount.accountUuid` from `~/.claude.json` and
+  thrown away when that changes, poll backoff included, so the new account is fetched on
+  the next render.
+- `cachedUsageUtilization` counts only while its own `accountUuid` matches; Claude Code
+  does not clear it on a switch.
+- A session's stdin payload names no account, and a session already running keeps the
+  token it started with. Its payload counts only if the session first rendered under the
+  current account **and** each window matches one the poll or `~/.claude.json` has seen
+  for that account. Both checks are needed: two accounts' five-hour windows can close on
+  the same minute, so boundaries alone cannot tell them apart.
+
 Two details that are easy to get wrong:
 
 - **Boundaries are compared with a ±120 s tolerance.** Each response recomputes `resets_at`
@@ -169,8 +186,11 @@ minute no matter how often the line redraws.
   Long names are elided from the middle: `rewrite-0809-integrated` and
   `rewrite-0809-integrated-compact` differ only in the suffix, so trimming the tail would
   render two different branches identically.
-- Credentials are read, never written. Refreshing the OAuth token is Claude Code's job; on
-  401 this backs off and keeps rendering from cache.
+- Credentials are read, never written, from where Claude Code keeps them: the Keychain on
+  macOS, then `~/.claude/.credentials.json`. The file is only a fallback there — Claude Code
+  writes it when the Keychain is locked, over ssh for instance, and never removes it, so it
+  is often an expired token or a previous account's. Refreshing the OAuth token is Claude
+  Code's job; on 401 this backs off and keeps rendering from cache.
 
 ## Environment variables
 

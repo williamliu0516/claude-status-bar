@@ -34,6 +34,13 @@ They are merged by a rule that needs no trust in write order or clock skew:
 
 A stale snapshot therefore can neither pull the number backwards nor revive a dead window.
 
+The same rule makes every reading from a previous login permanent -- a higher figure or a
+later boundary outranks the new account's for up to a week -- so everything is attributed
+to an account. The cache is stamped with `oauthAccount.accountUuid` and discarded when it
+changes, ~/.claude.json's figures count only when stamped with the same account, and a
+session's payload only when that session started under it and its window matches one the
+account is known to have.
+
 Why it has to be fast
 ---------------------
 It is registered at `refreshInterval: 1`, because the payload's own change-detection
@@ -44,8 +51,9 @@ subprocess imports are deferred into the paths that actually use them: `urllib.r
 alone costs 47 ms, three times the work of a whole render, and only the detached poll child
 ever needs it.
 
-Credentials are read, never written. Refreshing the OAuth token is Claude Code's job; on
-401 this backs off and keeps rendering from cache.
+Credentials are read, never written, from where Claude Code keeps them: the Keychain on
+macOS, then ~/.claude/.credentials.json. Refreshing the OAuth token is Claude Code's job;
+on 401 this backs off and keeps rendering from cache.
 """
 
 import json
@@ -67,6 +75,7 @@ CACHE_PATH = os.path.expanduser("~/.claude/statusline-usage.json")
 LOCK_PATH = CACHE_PATH + ".lock"
 CONFIG_PATH = os.path.expanduser("~/.claude.json")
 CREDENTIALS_PATH = os.path.expanduser("~/.claude/.credentials.json")
+KEYCHAIN_SERVICE = "Claude Code-credentials"
 SETTINGS_PATH = os.path.expanduser("~/.claude/settings.json")
 INSTALL_PATH = os.path.expanduser("~/.claude/statusline.py")
 
@@ -80,6 +89,8 @@ THROTTLED_BACKOFF = 300.0
 LOCK_STALE = 120.0
 WINDOW_TOLERANCE = 120.0
 MAX_WINDOW = 8 * 86400
+SESSION_TTL = 7 * 86400
+MAX_SESSIONS = 256
 WINDOWS = ("five_hour", "seven_day")
 
 RESET = "\033[0m"
@@ -233,6 +244,96 @@ def sub_dict(mapping, key):
     return value if isinstance(value, dict) else {}
 
 
+def current_account(config):
+    """The logged-in account's UUID from ~/.claude.json, or None when there is no login."""
+    uuid = sub_dict(config, "oauthAccount").get("accountUuid")
+    return uuid if isinstance(uuid, str) and uuid else None
+
+
+def account_cache(account):
+    """The shared cache, or a fresh one when it was written for a different account.
+
+    Every figure in it is a max over observations, so a window left over from the account
+    you just switched away from is not merely stale: if it reads higher, or resets later,
+    it outranks every reading of the new account until its own window expires -- a week,
+    for the weekly bar. The poll bookkeeping goes too, so the new account is fetched on the
+    next render rather than after the old one's backoff.
+    """
+    cache = read_json(CACHE_PATH)
+    if cache.get("account") != account:
+        cache = {"account": account, "sessions": sub_dict(cache, "sessions")}
+    return cache
+
+
+def own_session(cache, session_id, account, now):
+    """Did this session start under `account`? Records it on first sight.
+
+    A running session keeps the token it started with, so after a switch its payload goes
+    on describing the previous login -- and window boundaries alone cannot tell the two
+    apart, since both accounts' five-hour windows can close on the same minute. The
+    account current when a session first renders is the one it runs on, so that is
+    recorded once and trusted for the session's lifetime. A session that did pick up the
+    new login merely loses its payload; the poll and ~/.claude.json still cover it.
+    """
+    if not isinstance(session_id, str) or not session_id:
+        return True
+    sessions = sub_dict(cache, "sessions")
+    seen = sessions.get(session_id)
+    if not isinstance(seen, list) or len(seen) != 2:
+        live = {
+            key: value
+            for key, value in sessions.items()
+            if isinstance(value, list)
+            and len(value) == 2
+            and isinstance(value[1], (int, float))
+            and now - value[1] < SESSION_TTL
+        }
+        newest = sorted(live.items(), key=lambda item: item[1][1])[-(MAX_SESSIONS - 1) :]
+        seen = [account, now]
+        cache["sessions"] = dict(newest, **{session_id: seen})
+    return seen[0] == account
+
+
+def config_usage(config, account):
+    """`cachedUsageUtilization` from ~/.claude.json, when it belongs to `account`.
+
+    Claude Code stamps it with the account it was fetched for, and does not clear it on a
+    switch; until it next refreshes, it still describes the previous login.
+    """
+    cached = sub_dict(config, "cachedUsageUtilization")
+    owner = cached.get("accountUuid")
+    if owner is not None and owner != account:
+        return {}
+    return sub_dict(cached, "utilization")
+
+
+def anchored(rate_limits, anchors, account, now):
+    """The payload's windows that agree with a reading known to be this account's.
+
+    The payload names no account, and a session keeps the one it started with in memory
+    -- it goes on billing, and reporting, the previous login for hours after a switch made
+    in another window. So each of its windows is kept only when an attributable source
+    (the poll, ~/.claude.json) has seen the same window. That costs nothing when it
+    agrees: the payload still lifts the figure between polls, which is what it is for.
+    With no login to attribute anything to there is nothing to confuse it with.
+    """
+    if account is None:
+        return rate_limits
+    kept = {}
+    for name in WINDOWS:
+        entry = normalize(rate_limits.get(name))
+        if not plausible(entry, now):
+            continue
+        for anchor in (normalize(a.get(name)) for a in anchors):
+            if (
+                plausible(anchor, now)
+                and abs(anchor["resets_at"] - entry["resets_at"]) <= WINDOW_TOLERANCE
+            ):
+                kept[name] = rate_limits[name]
+                break
+    return kept
+
+
 def write_cache(data):
     """Atomic replace. A lost race between sessions self-heals on the next render.
 
@@ -266,6 +367,40 @@ def blend_into_cache(cache, contributions, now):
 # ------------------------------------------------------------------------ live poll
 
 
+def oauth_token(now):
+    """The access token Claude Code is currently using, or None when there is no live one.
+
+    On macOS Claude Code keeps its login in the Keychain and writes the plaintext file only
+    when the Keychain cannot be reached -- an ssh session, typically. That file is then
+    never cleaned up, so reading it first means polling with a token that expired long
+    ago, or with a previous account's. Resolve in the same order Claude Code does.
+    """
+    blocks = []
+    if sys.platform == "darwin":
+        import subprocess
+
+        try:
+            found = subprocess.run(
+                ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=5,
+            )
+            blocks.append(json.loads(found.stdout).get("claudeAiOauth"))
+        except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
+            pass
+    blocks.append(read_json(CREDENTIALS_PATH).get("claudeAiOauth"))
+    for block in blocks:
+        if not isinstance(block, dict) or not block.get("accessToken"):
+            continue
+        expires = block.get("expiresAt")
+        if isinstance(expires, (int, float)) and expires / 1000 <= now:
+            return None  # the current login's token; refreshing it is Claude Code's job
+        return block["accessToken"]
+    return None
+
+
 def poll():
     """Refresh the shared cache from the usage endpoint. Runs detached; output ignored."""
     import urllib.error
@@ -284,15 +419,16 @@ def poll():
         return
 
     now = time.time()
+    account = current_account(read_json(CONFIG_PATH))
     try:
         # Re-check under the lock. Children spawned while the previous poller held it would
         # otherwise each fire the moment it is released, turning one due refresh into a
         # burst of requests -- which is what earns a 429.
-        cache = read_json(CACHE_PATH)
+        cache = account_cache(account)
         if now - cache.get("polled_at", 0) < POLL_SECONDS or now < cache.get("retry_after", 0):
             return
 
-        token = (read_json(CREDENTIALS_PATH).get("claudeAiOauth") or {}).get("accessToken")
+        token = oauth_token(now)
         if not token:
             return
         request = urllib.request.Request(
@@ -305,7 +441,7 @@ def poll():
         )
         with urllib.request.urlopen(request, timeout=8) as response:
             fresh = json.load(response)
-        cache = blend_into_cache(read_json(CACHE_PATH), [fresh], now)
+        cache = blend_into_cache(account_cache(account), [fresh], now)
         cache["polled_at"] = now
         cache.pop("retry_after", None)
         write_cache(cache)
@@ -324,7 +460,7 @@ def poll():
                 # which taken literally would cancel the backoff entirely and leave us
                 # asking again at every poll interval for as long as it keeps refusing.
                 backoff = max(backoff, float(retry_after.strip()))
-        cache = read_json(CACHE_PATH)
+        cache = account_cache(account)
         cache["polled_at"] = now
         cache["retry_after"] = now + backoff
         write_cache(cache)
@@ -545,12 +681,18 @@ def main():
         payload = {}
 
     now = time.time()
-    cache = read_json(CACHE_PATH)
-    utilization = sub_dict(sub_dict(read_json(CONFIG_PATH), "cachedUsageUtilization"), "utilization")
-    contributions = [sub_dict(payload, "rate_limits"), utilization]
+    config = read_json(CONFIG_PATH)
+    account = current_account(config)
+    stored = read_json(CACHE_PATH)
+    cache = account_cache(account)
+    utilization = config_usage(config, account)
+    rate_limits = {}
+    if own_session(cache, payload.get("session_id"), account, now):
+        rate_limits = anchored(sub_dict(payload, "rate_limits"), [utilization, cache], account, now)
+    contributions = [rate_limits, utilization]
 
     merged = blend_into_cache(cache, contributions, now)
-    if merged != cache:
+    if merged != stored:
         write_cache(merged)
     spawn_poll(merged, now)
 
