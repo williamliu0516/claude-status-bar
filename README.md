@@ -52,8 +52,9 @@ Delete the `statusLine` key from `~/.claude/settings.json` and remove
 Bars are coloured by pace, not by how much is spent: the figure each window is on course to
 reach by its reset if the rest of it burns at the average rate so far. Green below 80%,
 yellow from 80%, red from 100% — on course to run out before the reset — and bold red once
-90% is actually used, whatever the pace. From 80% the projection is printed beside the
-figure, `70% →120%`. So 60% with half a day left stays green, where 60% on the first day of
+90% is actually used, whatever the pace. From 80% the weekly projection is printed beside
+the figure, `70% →120%`; the 5-hour bar shows its pace by colour only. So 60% with half a
+day left stays green, where 60% on the first day of
 the week does not. Elapsed time is floored at 15% of the window (about 45 minutes, or a
 day), so one large prompt at the start of a window does not read as a runaway.
 

@@ -6,8 +6,8 @@ Reads the status line JSON payload on stdin (schema: `claude` 2.1.x), prints one
     we-rewrite-compact │ rewrite-0809-integrated │ Opus 5.5 1M xhigh │ 5h ██░░ 24% ·1h43m │ …
 
 Usage is colored by pace -- the figure each window is on course to reach by its reset --
-rather than by how much is spent so far, and the projection is printed (`62% →104%`) once
-it runs hot. On a narrow terminal the line sheds detail in a fixed order (see `LAYOUTS`)
+rather than by how much is spent so far, and the weekly projection is printed
+(`62% →104%`) once it runs hot. On a narrow terminal the line sheds detail in a fixed order (see `LAYOUTS`)
 instead of letting Claude Code cut the weekly bar off the end.
 
 Install with `python3 statusline.py --install`.
@@ -100,6 +100,9 @@ WINDOWS = ("five_hour", "seven_day")
 WINDOW_SECONDS = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}
 PACE_FLOOR = 0.15
 PACE_WARN = 80
+# The 5h bar's colour already carries its pace, and its countdown is short enough to read
+# directly; a projected figure beside it was noise. The weekly one is days out, so it stays.
+PROJECTED = ("seven_day",)
 
 RESET = "\033[0m"
 DIM = "\033[2m"
@@ -577,10 +580,11 @@ def countdown(resets_at, now):
 
 
 def window(label, name, data, was_seen, now, layout):
-    """One rate-limit window: `5h ████░░░░  47% ·2h13m`, or `… 62% →104% ·1h10m` when hot.
+    """One rate-limit window: `5h ████░░░░  47% ·2h13m`, or `wk … 62% →104% ·2d4h` when hot.
 
-    The projection survives every layout step: on a narrow terminal it is the one figure
-    that says whether to slow down, so a countdown or the bar goes first.
+    The projection (weekly only, see PROJECTED) survives every layout step: on a narrow
+    terminal it is the one figure that says whether to slow down, so a countdown or the
+    bar goes first.
     """
     cells = layout["bar"]
     if data is None:
@@ -596,7 +600,7 @@ def window(label, name, data, was_seen, now, layout):
     # Padded to three digits beside a bar so the bar does not jump as the figure grows.
     figure = f"{bar(pct, cells)} {pct:3.0f}%" if cells else f"{pct:.0f}%"
     cell = f"{DIM}{label}{RESET} {color}{figure}{RESET}"
-    if pace >= PACE_WARN and round(pace) > round(pct):
+    if name in PROJECTED and pace >= PACE_WARN and round(pace) > round(pct):
         cell += f" {color}→{min(pace, 999):.0f}%{RESET}"
     if name in layout["countdown"]:
         cell += f" {DIM}·{countdown(data['resets_at'], now)}{RESET}"
