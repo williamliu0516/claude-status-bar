@@ -5,7 +5,7 @@ folder, the git branch, the model and effort level, and — the part that takes 
 5-hour and weekly usage that is actually correct.
 
 ```
-we-rewrite-compact  │  rewrite-0809-integrated  │  Opus 5 1M xhigh  │  5h ██░░░░░░  24% ·1h43m  │  wk ██████░░  70% ·2d22h
+● a3f9c2  │  we-rewrite-compact  │  rewrite-0809-integrated  │  Opus 5.5 1M xhigh  │  5h ██░░░░░░  24% ·1h43m  │  wk ██████░░  70% →120% ·2d22h
 ```
 
 ## Install
@@ -50,7 +50,13 @@ Delete the `statusLine` key from `~/.claude/settings.json` and remove
 | `5h` | 5-hour usage window: bar, percentage, time until reset |
 | `wk` | weekly usage window, same |
 
-Bars turn yellow at 50%, red at 75%, bold red at 90%.
+Bars are coloured by pace, not by how much is spent: the figure each window is on course to
+reach by its reset if the rest of it burns at the average rate so far. Green below 80%,
+yellow from 80%, red from 100% — on course to run out before the reset — and bold red once
+90% is actually used, whatever the pace. From 80% the projection is printed beside the
+figure, `70% →120%`. So 60% with half a day left stays green, where 60% on the first day of
+the week does not. Elapsed time is floored at 15% of the window (about 45 minutes, or a
+day), so one large prompt at the start of a window does not read as a runaway.
 
 ## The session identifier
 
@@ -181,8 +187,13 @@ minute no matter how often the line redraws.
   runs 60 times a minute. Linked worktrees and submodules keep a `.git` **file** holding a
   `gitdir:` pointer instead of a directory, which the resolver follows — a naive walk up the
   tree reports "not a repository" for every worktree checkout.
-- The branch cell is sized to whatever the other cells leave on the current terminal, and is
-  dropped entirely when there is no room, so it can never push the usage bars off-screen.
+- Claude Code draws the line on one row and cuts the overflow from the end, which is where
+  the weekly bar sits. So the line sheds detail in a fixed order until it fits: tighter
+  separators, then the branch, the bars from eight cells to four to none, the weekly and then
+  the 5-hour countdown, effort, folder, model, and the session tag; the percentages and the
+  projection go last. The width it fits is `COLUMNS` minus 4 — the line sits in a box padded
+  two columns each side, and sizing to the full terminal loses the last cells to a `…`.
+- The branch cell is sized to whatever the other cells leave, down to ten columns.
   Long names are elided from the middle: `rewrite-0809-integrated` and
   `rewrite-0809-integrated-compact` differ only in the suffix, so trimming the tail would
   render two different branches identically.

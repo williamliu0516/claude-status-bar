@@ -3,7 +3,12 @@
 
 Reads the status line JSON payload on stdin (schema: `claude` 2.1.x), prints one line.
 
-    we-rewrite-compact │ rewrite-0809-integrated │ Opus 5 1M xhigh │ 5h ██░░ 24% ·1h43m │ …
+    we-rewrite-compact │ rewrite-0809-integrated │ Opus 5.5 1M xhigh │ 5h ██░░ 24% ·1h43m │ …
+
+Usage is colored by pace -- the figure each window is on course to reach by its reset --
+rather than by how much is spent so far, and the projection is printed (`62% →104%`) once
+it runs hot. On a narrow terminal the line sheds detail in a fixed order (see `LAYOUTS`)
+instead of letting Claude Code cut the weekly bar off the end.
 
 Install with `python3 statusline.py --install`.
 
@@ -69,6 +74,7 @@ BAR_FULL = "█"
 BAR_EMPTY = "░"
 BRANCH_CELLS = 32
 BRANCH_FLOOR = 10
+STATUS_INSET = 4
 ANSI = re.compile(r"\033\[[0-9;]*m")
 
 CACHE_PATH = os.path.expanduser("~/.claude/statusline-usage.json")
@@ -92,6 +98,9 @@ MAX_WINDOW = 8 * 86400
 SESSION_TTL = 7 * 86400
 MAX_SESSIONS = 256
 WINDOWS = ("five_hour", "seven_day")
+WINDOW_SECONDS = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}
+PACE_FLOOR = 0.15
+PACE_WARN = 80
 
 RESET = "\033[0m"
 DIM = "\033[2m"
@@ -103,6 +112,7 @@ GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
 SEP = f"{DIM}  │  {RESET}"
+SEP_NARROW = f"{DIM} │ {RESET}"
 
 # ---------------------------------------------------------------- identity
 #
@@ -569,19 +579,38 @@ def elide(text, width):
 # --------------------------------------------------------------------------- display
 
 
-def usage_color(pct):
+def projected(data, length, now):
+    """Utilization at reset if the rest of the window burns at its average rate so far.
+
+    Elapsed time is floored at PACE_FLOOR of the window. In the first minutes one large
+    prompt is most of what has been spent, and dividing by those minutes would read it as
+    a runaway; the floor treats it as spread over the first ~45 min (5h) or ~25 h (weekly).
+    It also absorbs most of the error from `resets_at` being reported rounded to the hour.
+    """
+    elapsed = length - (data["resets_at"] - now)
+    return data["used_percentage"] / max(elapsed / length, PACE_FLOOR)
+
+
+def usage_color(pct, pace):
+    """Color by where the window is heading, not by how much of it is gone.
+
+    Fixed thresholds on the spent figure paint 60% on the last day of the week the same
+    yellow as 60% on its first, when only the second is a problem. `pace` is never below
+    `pct`, so a window that is actually nearly full still shows it; past 90% it is flagged
+    regardless, since a single long turn can cross the rest.
+    """
     if pct >= 90:
         return BOLD + RED
-    if pct >= 75:
+    if pace >= 100:
         return RED
-    if pct >= 50:
+    if pace >= PACE_WARN:
         return YELLOW
     return GREEN
 
 
-def bar(pct):
-    filled = min(BAR_CELLS, max(0, round(pct / 100 * BAR_CELLS)))
-    return BAR_FULL * filled + BAR_EMPTY * (BAR_CELLS - filled)
+def bar(pct, cells):
+    filled = min(cells, max(0, round(pct / 100 * cells)))
+    return BAR_FULL * filled + BAR_EMPTY * (cells - filled)
 
 
 def countdown(resets_at, now):
@@ -599,18 +628,31 @@ def countdown(resets_at, now):
     return f"{minutes}m"
 
 
-def window(label, data, was_seen, now):
-    """One rate-limit window: `5h ████░░░░  47% ·2h13m`."""
+def window(label, name, data, was_seen, now, layout):
+    """One rate-limit window: `5h ████░░░░  47% ·2h13m`, or `… 62% →104% ·1h10m` when hot.
+
+    The projection survives every layout step: on a narrow terminal it is the one figure
+    that says whether to slow down, so a countdown or the bar goes first.
+    """
+    cells = layout["bar"]
     if data is None:
         if was_seen:
             # The window rolled over, so its old figure is gone and usage restarted at ~0.
-            return f"{DIM}{label}{RESET} {GREEN}{BAR_EMPTY * BAR_CELLS}{RESET} {DIM}~0%{RESET}"
-        return f"{DIM}{label} {BAR_EMPTY * BAR_CELLS}  --{RESET}"
+            empty = f"{GREEN}{BAR_EMPTY * cells}{RESET} " if cells else ""
+            return f"{DIM}{label}{RESET} {empty}{DIM}~0%{RESET}"
+        empty = f" {BAR_EMPTY * cells} " if cells else ""
+        return f"{DIM}{label}{empty} --{RESET}"
     pct = data["used_percentage"]
-    return (
-        f"{DIM}{label}{RESET} {usage_color(pct)}{bar(pct)} {pct:3.0f}%{RESET}"
-        f" {DIM}·{countdown(data['resets_at'], now)}{RESET}"
-    )
+    pace = projected(data, WINDOW_SECONDS[name], now)
+    color = usage_color(pct, pace)
+    # Padded to three digits beside a bar so the bar does not jump as the figure grows.
+    figure = f"{bar(pct, cells)} {pct:3.0f}%" if cells else f"{pct:.0f}%"
+    cell = f"{DIM}{label}{RESET} {color}{figure}{RESET}"
+    if pace >= PACE_WARN and round(pace) > round(pct):
+        cell += f" {color}→{min(pace, 999):.0f}%{RESET}"
+    if name in layout["countdown"]:
+        cell += f" {DIM}·{countdown(data['resets_at'], now)}{RESET}"
+    return cell
 
 
 def short_model(name):
@@ -624,15 +666,85 @@ def printed_width(text):
 
 
 def terminal_columns():
-    """Claude Code exports COLUMNS to the status line command; our stdout is a pipe.
+    """Columns the status line actually gets, from the COLUMNS Claude Code exports to it.
 
-    Read from the environment rather than `shutil.get_terminal_size`, which costs 9 ms of
-    imports to reach the same variable and then falls back to 80 anyway.
+    COLUMNS is the whole terminal, but the line is drawn inside a box padded two columns
+    on each side; measured on 2.1.289, a 120-column terminal shows 116 before Claude Code
+    swaps the last one for `…`. Read from the environment rather than
+    `shutil.get_terminal_size`, which costs 9 ms of imports to reach the same variable and
+    then falls back to 80 anyway.
     """
     try:
-        return int(os.environ["COLUMNS"])
+        columns = int(os.environ["COLUMNS"])
     except (KeyError, ValueError):
-        return 80
+        columns = 80
+    return columns - STATUS_INSET
+
+
+def ladder(first, *steps):
+    """`first`, then each step applied on top of everything before it."""
+    layouts = [first]
+    for step in steps:
+        layouts.append(dict(layouts[-1], **step))
+    return tuple(layouts)
+
+
+# Most detailed first; each step gives up the least useful thing still on the line. Claude
+# Code renders the status line on one row and cuts the overflow from the end -- which is
+# where the weekly bar sits -- so the trimming has to happen here, and the usage figures,
+# the reason this script exists, are the last thing standing.
+LAYOUTS = ladder(
+    {
+        "sep": SEP,
+        "branch": True,
+        "bar": BAR_CELLS,
+        "countdown": WINDOWS,
+        "effort": True,
+        "folder": True,
+        "model": True,
+        "ident": True,
+    },
+    {"sep": SEP_NARROW},  # whitespace goes before anything that carries information
+    {"branch": False},
+    {"bar": BAR_CELLS // 2},
+    {"bar": 0},
+    {"countdown": ("five_hour",)},  # the weekly reset is days out; the 5h one is actionable
+    {"countdown": ()},
+    {"effort": False},
+    {"folder": False},
+    {"model": False},
+    {"ident": False},  # outlasts the model: it is how a session is found on the keyboard panel
+)
+
+
+def render(layout, info, now, columns):
+    """The status line under `layout`, and whether it fits in `columns`."""
+    cells = []
+    # Ahead of the folder: the identifier answers "which session am I looking at", which is
+    # the question you ask before any of the numbers matter.
+    if info["ident"] and layout["ident"]:
+        cells.append(info["ident"])
+    if layout["folder"]:
+        cells.append(f"{CYAN}{BOLD}{info['folder']}{RESET}")
+    branch_slot = len(cells)  # immediately after the folder, wherever the identifier left it
+    if layout["model"]:
+        model_cell = f"{BLUE}{short_model(info['model'])}{RESET}"
+        if info["effort"] and layout["effort"]:
+            model_cell += f" {DIM}{info['effort']}{RESET}"
+        cells.append(model_cell)
+    for label, name in (("5h", "five_hour"), ("wk", "seven_day")):
+        cells.append(window(label, name, info["usage"].get(name), info["seen"][name], now, layout))
+
+    sep = layout["sep"]
+    room = columns - printed_width(sep.join(cells))
+    if info["branch"] and layout["branch"]:
+        # The branch takes only what the fixed cells leave, down to a floor below which a
+        # name is no longer recognisable; under that, this layout does not fit.
+        room = min(BRANCH_CELLS, room - printed_width(sep))
+        if room < BRANCH_FLOOR:
+            return sep.join(cells), False
+        cells.insert(branch_slot, f"{MAGENTA}{elide(info['branch'], room)}{RESET}")
+    return sep.join(cells), room >= 0
 
 
 # ------------------------------------------------------------------------------ main
@@ -707,34 +819,24 @@ def main():
     model = model if isinstance(model, str) and model else "?"
     effort = sub_dict(payload, "effort").get("level")
 
-    model_cell = f"{BLUE}{short_model(model)}{RESET}"
-    if effort:
-        model_cell += f" {DIM}{effort}{RESET}"
-
-    cells = [f"{CYAN}{BOLD}{os.path.basename(cwd)}{RESET}", model_cell]
-    # Ahead of the folder: the identifier answers "which session am I looking
-    # at", which is the question you ask before any of the numbers matter.
-    ident = ident_cell(payload.get("session_id"))
-    if ident:
-        cells.insert(0, ident)
-    branch_slot = len(cells) - 1  # immediately after the folder, wherever the identifier left it
-    for label, name in (("5h", "five_hour"), ("wk", "seven_day")):
-        seen = any(normalize(c.get(name)) for c in contributions + [cache])
-        cells.append(window(label, merged.get(name), seen, now))
-
-    # The branch takes only what the fixed cells leave. Claude Code renders this on one row
-    # and truncates the overflow, so sizing it blind would push the usage bars off a narrow
-    # terminal -- and the bars are the reason this script exists.
-    branch = git_branch(cwd)
-    if branch:
-        room = min(
-            BRANCH_CELLS,
-            terminal_columns() - printed_width(SEP.join(cells)) - printed_width(SEP),
-        )
-        if room >= BRANCH_FLOOR:
-            cells.insert(branch_slot, f"{MAGENTA}{elide(branch, room)}{RESET}")
-
-    sys.stdout.write(SEP.join(cells))
+    info = {
+        "ident": ident_cell(payload.get("session_id")),
+        "folder": os.path.basename(cwd),
+        "branch": git_branch(cwd),
+        "model": model,
+        "effort": effort,
+        "usage": merged,
+        "seen": {
+            name: any(normalize(c.get(name)) for c in contributions + [cache]) for name in WINDOWS
+        },
+    }
+    columns = terminal_columns()
+    # Nothing fitting at all leaves the sparsest line, for Claude Code to cut as it must.
+    for layout in LAYOUTS:
+        line, fits = render(layout, info, now, columns)
+        if fits:
+            break
+    sys.stdout.write(line)
 
 
 if __name__ == "__main__":
