@@ -461,6 +461,11 @@ def poll():
                 # asking again at every poll interval for as long as it keeps refusing.
                 backoff = max(backoff, float(retry_after.strip()))
         cache = account_cache(account)
+        if not any(name in cache for name in WINDOWS):
+            # Nothing to serve in the meantime -- the first poll after an account switch,
+            # when the payload has no anchor and ~/.claude.json no figures yet. A long
+            # backoff here is five minutes of blank bars, so retry at the poll interval.
+            backoff = POLL_SECONDS
         cache["polled_at"] = now
         cache["retry_after"] = now + backoff
         write_cache(cache)
