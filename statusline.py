@@ -62,7 +62,6 @@ on 401 this backs off and keeps rendering from cache.
 """
 
 import json
-import hashlib
 import os
 import re
 import sys
@@ -113,57 +112,6 @@ YELLOW = "\033[33m"
 RED = "\033[31m"
 SEP = f"{DIM}  │  {RESET}"
 SEP_NARROW = f"{DIM} │ {RESET}"
-
-# ---------------------------------------------------------------- identity
-#
-# SESSION IDENTIFIER SPEC v1 -- implemented identically here and in
-# context-keyboard-display/collect.py, which draws the same tag and colour on a
-# 142x428 keyboard panel. The two repositories share no code, so the
-# specification below is the entire contract; it is reproduced verbatim in both
-# READMEs. Integer arithmetic only, deliberately: no float, no locale, no
-# terminal metrics, so two independent implementations cannot drift.
-#
-#   tag   = session_id[:6], lowercased          (a UUID, so these are hex)
-#   slot  = sha1(session_id utf-8).digest()[0] % 8
-#   xterm = IDENT_PALETTE[slot]
-#   rgb   = the xterm-256 colour cube entry for that index:
-#             i = xterm - 16;  r = i // 36;  g = (i // 6) % 6;  b = i % 6
-#             rgb = (IDENT_CUBE[r], IDENT_CUBE[g], IDENT_CUBE[b])
-#
-# Eight slots, not sixteen, and the reason is measured rather than assumed. The
-# panel's own source records that two of its semantic colours "are too close in
-# hue to tell apart" at a 12 px dot; that pair is dE 37.3 in CIE-Lab. A
-# sixteen-slot palette gets its two nearest members down to dE 30.5 -- below
-# the distance already proven indistinguishable. Eight slots hold dE 61.5,
-# 1.65x that threshold, and stay dE 34.1 clear of every colour the panel uses
-# to mean something.
-#
-# Eight also divides 256, so `digest[0] % 8` is exactly uniform where % 10 or
-# % 12 would over-weight the low slots.
-#
-# Fewer slots means colours do repeat across concurrent sessions. That is the
-# honest trade: a repeat is *visibly identical*, which reads as "check the
-# tag", where a sixteen-slot near-miss would read as "these are different"
-# when they are not. The tag is the authority; the colour is the fast path.
-#
-# 256-colour SGR, not 24-bit: Terminal.app renders the former and ignores the
-# latter, and the panel quantises to the same cube so both show one colour.
-IDENT_CUBE = (0, 95, 135, 175, 215, 255)
-IDENT_PALETTE = (45, 46, 49, 69, 201, 202, 211, 228)
-IDENT_DOT = "\u25cf"
-
-
-def ident_cell(session_id):
-    """Colour dot + six-character tag, or None when the payload carries no id.
-
-    None rather than a placeholder: a tag that matches nothing on the panel is
-    a cell's worth of noise in a line that is already fighting for columns.
-    """
-    if not isinstance(session_id, str) or not session_id:
-        return None
-    slot = hashlib.sha1(session_id.encode("utf-8")).digest()[0] % len(IDENT_PALETTE)
-    xterm = IDENT_PALETTE[slot]
-    return f"\033[38;5;{xterm}m{IDENT_DOT}{RESET} {DIM}{session_id[:6].lower()}{RESET}"
 
 
 # --------------------------------------------------------------------------- merging
@@ -702,7 +650,6 @@ LAYOUTS = ladder(
         "effort": True,
         "folder": True,
         "model": True,
-        "ident": True,
     },
     {"sep": SEP_NARROW},  # whitespace goes before anything that carries information
     {"branch": False},
@@ -713,20 +660,14 @@ LAYOUTS = ladder(
     {"effort": False},
     {"folder": False},
     {"model": False},
-    {"ident": False},  # outlasts the model: it is how a session is found on the keyboard panel
 )
 
 
 def render(layout, info, now, columns):
     """The status line under `layout`, and whether it fits in `columns`."""
     cells = []
-    # Ahead of the folder: the identifier answers "which session am I looking at", which is
-    # the question you ask before any of the numbers matter.
-    if info["ident"] and layout["ident"]:
-        cells.append(info["ident"])
     if layout["folder"]:
         cells.append(f"{CYAN}{BOLD}{info['folder']}{RESET}")
-    branch_slot = len(cells)  # immediately after the folder, wherever the identifier left it
     if layout["model"]:
         model_cell = f"{BLUE}{short_model(info['model'])}{RESET}"
         if info["effort"] and layout["effort"]:
@@ -743,7 +684,7 @@ def render(layout, info, now, columns):
         room = min(BRANCH_CELLS, room - printed_width(sep))
         if room < BRANCH_FLOOR:
             return sep.join(cells), False
-        cells.insert(branch_slot, f"{MAGENTA}{elide(info['branch'], room)}{RESET}")
+        cells.insert(1, f"{MAGENTA}{elide(info['branch'], room)}{RESET}")
     return sep.join(cells), room >= 0
 
 
@@ -820,7 +761,6 @@ def main():
     effort = sub_dict(payload, "effort").get("level")
 
     info = {
-        "ident": ident_cell(payload.get("session_id")),
         "folder": os.path.basename(cwd),
         "branch": git_branch(cwd),
         "model": model,

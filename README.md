@@ -5,7 +5,7 @@ folder, the git branch, the model and effort level, and — the part that takes 
 5-hour and weekly usage that is actually correct.
 
 ```
-● a3f9c2  │  we-rewrite-compact  │  rewrite-0809-integrated  │  Opus 5.5 1M xhigh  │  5h ██░░░░░░  24% ·1h43m  │  wk ██████░░  70% →120% ·2d22h
+we-rewrite-compact  │  rewrite-0809-integrated  │  Opus 5.5 1M xhigh  │  5h ██░░░░░░  24% ·1h43m  │  wk ██████░░  70% →120% ·2d22h
 ```
 
 ## Install
@@ -42,7 +42,6 @@ Delete the `statusLine` key from `~/.claude/settings.json` and remove
 
 | Cell | Notes |
 | --- | --- |
-| session | colour dot + six-character tag identifying this session — see below |
 | folder | basename of the session's working directory |
 | branch | current git branch, `@a1b2c3d` when HEAD is detached, hidden outside a repo |
 | model | `display_name`, with `(1M context)` shortened to `1M` |
@@ -57,57 +56,6 @@ yellow from 80%, red from 100% — on course to run out before the reset — and
 figure, `70% →120%`. So 60% with half a day left stays green, where 60% on the first day of
 the week does not. Elapsed time is floored at 15% of the window (about 45 minutes, or a
 day), so one large prompt at the start of a window does not read as a runaway.
-
-## The session identifier
-
-The first cell is a coloured dot and six characters, derived from this
-session's `session_id`. It exists so that a second display can show the *same*
-mark for the *same* session — specifically
-[context-keyboard-display](https://github.com/williamliu-h/context-keyboard-display),
-which drives a 142×428 keyboard panel and cannot otherwise tell you which of
-several open terminals the session on screen belongs to.
-
-The two projects share no code. This specification is the entire contract, and
-it is reproduced verbatim in both READMEs:
-
-```
-SESSION IDENTIFIER SPEC v1
-
-  tag   = session_id[:6], lowercased          (a UUID, so these are hex)
-  slot  = sha1(session_id utf-8).digest()[0] % 8
-  xterm = PALETTE[slot]
-  rgb   = the xterm-256 colour cube entry for that index:
-            i = xterm - 16;  r = i // 36;  g = (i // 6) % 6;  b = i % 6
-            rgb = (CUBE[r], CUBE[g], CUBE[b])
-
-  PALETTE = (45, 46, 49, 69, 201, 202, 211, 228)
-  CUBE    = (0, 95, 135, 175, 215, 255)
-
-  Terminal renders ESC[38;5;{xterm}m ● ; a full-colour display fills a dot
-  with rgb. Both therefore show one colour, not two similar ones.
-```
-
-Integer arithmetic only, deliberately — no float, no locale, no font or
-terminal metrics — so two independent implementations cannot drift.
-
-**Why eight slots and not sixteen.** The panel's source records that two of its
-semantic colours "are too close in hue to tell apart" at a 12 px dot; that pair
-measures ΔE 37.3 in CIE-Lab. A sixteen-slot palette selected from the same
-colour cube gets its two nearest members down to ΔE 30.5 — *below* a distance
-already proven indistinguishable on the target hardware. Eight slots hold
-ΔE 61.5, 1.65× that threshold, and stay ΔE 34.1 clear of every colour the panel
-uses to mean something. Eight also divides 256, so `digest[0] % 8` is exactly
-uniform where `% 10` or `% 12` would over-weight the low slots.
-
-**Colours do repeat.** With eight slots, three concurrent sessions collide
-about 34% of the time. That is the deliberate trade: a repeat is *visibly
-identical*, which reads as "check the tag", where a sixteen-slot near-miss
-would read as "these are different" when they are not. The tag is the
-authority; the colour is the fast path to it.
-
-**256-colour SGR, not 24-bit.** Terminal.app renders the former and ignores the
-latter, and the panel quantises to the same cube — which is why the contract
-specifies a cube index rather than an RGB triple.
 
 ## Why the usage numbers need this much work
 
@@ -190,8 +138,8 @@ minute no matter how often the line redraws.
 - Claude Code draws the line on one row and cuts the overflow from the end, which is where
   the weekly bar sits. So the line sheds detail in a fixed order until it fits: tighter
   separators, then the branch, the bars from eight cells to four to none, the weekly and then
-  the 5-hour countdown, effort, folder, model, and the session tag; the percentages and the
-  projection go last. The width it fits is `COLUMNS` minus 4 — the line sits in a box padded
+  the 5-hour countdown, effort, folder and model; the percentages and the projection go
+  last. The width it fits is `COLUMNS` minus 4 — the line sits in a box padded
   two columns each side, and sizing to the full terminal loses the last cells to a `…`.
 - The branch cell is sized to whatever the other cells leave, down to ten columns.
   Long names are elided from the middle: `rewrite-0809-integrated` and
