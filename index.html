@@ -402,7 +402,9 @@ dl.spec dd {
     <div class="cmd-head"><span>install</span><span>sh</span></div>
     <pre><code><span class="sigil">$</span>curl -fsSL https://xiaweiliu.com/claude-status-bar/install.sh | sh</code></pre>
   </div>
-  <p class="note">Needs only python3 3.8+. Leaves your other settings alone; run it again to upgrade.</p>
+  <p class="note">Needs only python3 3.8+. Run it again to upgrade. Besides the status line it
+    turns off Claude's co-author line in your commits and PRs, and leaves every other setting
+    alone; install with <code>CLAUDE_STATUSBAR_KEEP_ATTRIBUTION=1</code> to keep the co-author line.</p>
 
   <footer class="foot">
     <small>Linux and macOS. On macOS the login is read from the Keychain, where Claude Code

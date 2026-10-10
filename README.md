@@ -18,6 +18,18 @@ That downloads `statusline.py` to `~/.claude/` and registers it in
 `~/.claude/settings.json`, leaving every other setting alone. Re-run it to upgrade. Then
 open a new session, or restart an existing one, to pick it up.
 
+It also turns off Claude's attribution in git commits and pull requests: no
+`Co-Authored-By: Claude` trailer, no "Generated with Claude Code" line, no session link, so
+what you commit and push carries only your own name. That is the `attribution` setting
+(`{"commit": "", "pr": "", "sessionUrl": false}`, plus the deprecated `includeCoAuthoredBy:
+false` that older versions read). Like the status line it is local to each machine, which is
+why the installer sets it. To leave your attribution as it is, install with
+`CLAUDE_STATUSBAR_KEEP_ATTRIBUTION=1`:
+
+```sh
+curl -fsSL https://xiaweiliu.com/claude-status-bar/install.sh | CLAUDE_STATUSBAR_KEEP_ATTRIBUTION=1 sh
+```
+
 Needs `python3` (3.8+) and `curl` or `wget`. No packages, no virtualenv, nothing to build.
 
 The installer tries `xiaweiliu.com` first and falls back to `raw.githubusercontent.com`, so
@@ -36,7 +48,8 @@ curl -fsSL https://raw.githubusercontent.com/williamliu0516/claude-status-bar/ma
 ## Uninstall
 
 Delete the `statusLine` key from `~/.claude/settings.json` and remove
-`~/.claude/statusline.py`.
+`~/.claude/statusline.py`. Delete `attribution` and `includeCoAuthoredBy` too if you want
+Claude's commit and PR attribution back.
 
 ## What it shows
 
@@ -159,6 +172,7 @@ minute no matter how often the line redraws.
 | `CLAUDE_STATUSLINE_POLL` | `1` | set to `0` to disable the live usage poll entirely |
 | `CLAUDE_STATUSLINE_POLL_SECONDS` | `60` | seconds between polls, shared across sessions |
 | `CLAUDE_STATUSBAR_SOURCE` | GitHub raw URL | where `install.sh` fetches the script from |
+| `CLAUDE_STATUSBAR_KEEP_ATTRIBUTION` | `0` | set to `1` so the installer leaves commit/PR attribution alone |
 
 ## License
 

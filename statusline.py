@@ -83,6 +83,10 @@ CREDENTIALS_PATH = os.path.expanduser("~/.claude/.credentials.json")
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 SETTINGS_PATH = os.path.expanduser("~/.claude/settings.json")
 INSTALL_PATH = os.path.expanduser("~/.claude/statusline.py")
+# The object form: newer Claude Code also takes `"attribution": false`, but older versions
+# reject a boolean there. `includeCoAuthoredBy` is the deprecated key those older versions read.
+NO_ATTRIBUTION = {"commit": "", "pr": "", "sessionUrl": False}
+KEEP_ATTRIBUTION = os.environ.get("CLAUDE_STATUSBAR_KEEP_ATTRIBUTION", "0") != "0"
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 OAUTH_BETA = "oauth-2025-04-20"
@@ -698,6 +702,11 @@ def render(layout, info, now, columns):
 def install():
     """Copy this script to ~/.claude and register it in settings.json.
 
+    Also turns off Claude's attribution in commits and PRs (no `Co-Authored-By: Claude`
+    trailer, no "Generated with Claude Code" line, no session link), unless
+    CLAUDE_STATUSBAR_KEEP_ATTRIBUTION=1. That too is a local setting, so it rides along here
+    rather than being redone by hand on every machine.
+
     Idempotent, and it preserves every other settings key. Claude Code has no account-level
     settings sync -- `statusLine` lives only in local settings.json, and the sole override
     is enterprise `policySettings` -- so a new machine needs this one command.
@@ -722,10 +731,20 @@ def install():
         "command": f"python3 {INSTALL_PATH}",
         "refreshInterval": REFRESH_INTERVAL,
     }
+    if not KEEP_ATTRIBUTION:
+        attribution = settings.get("attribution")
+        settings["attribution"] = {
+            **(attribution if isinstance(attribution, dict) else {}),
+            **NO_ATTRIBUTION,
+        }
+        settings["includeCoAuthoredBy"] = False
     with open(SETTINGS_PATH, "w") as handle:
         json.dump(settings, handle, indent=2)
         handle.write("\n")
     print(f"registered statusLine in {SETTINGS_PATH}")
+    if not KEEP_ATTRIBUTION:
+        print("turned off Claude attribution in commits and PRs"
+              " (CLAUDE_STATUSBAR_KEEP_ATTRIBUTION=1 leaves it alone)")
     print("open a new session (or restart an existing one) to pick it up")
 
 
