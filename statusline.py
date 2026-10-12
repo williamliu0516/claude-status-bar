@@ -3,7 +3,7 @@
 
 Reads the status line JSON payload on stdin (schema: `claude` 2.1.x), prints one line.
 
-    we-rewrite-compact │ rewrite-0809-integrated │ Opus 5.5 1M xhigh │ 5h ██░░ 24% ·1h43m │ …
+    we-rewrite-compact │ rewrite-0809-integrated │ Opus 5.5 1M xhigh │ █▉       24% ·1h43m │ …
 
 Usage is colored by pace -- the figure each window is on course to reach by its reset --
 rather than by how much is spent so far, and the weekly projection is printed
@@ -69,8 +69,7 @@ import time
 from datetime import datetime, timezone
 
 BAR_CELLS = 8
-BAR_FULL = "█"
-BAR_EMPTY = "░"
+BAR_EIGHTHS = " ▏▎▍▌▋▊▉"  # left-aligned partial blocks, 0/8 to 7/8 of a cell
 BRANCH_CELLS = 32
 BRANCH_FLOOR = 10
 STATUS_INSET = 4
@@ -117,6 +116,11 @@ MAGENTA = "\033[35m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
+# The bar's unfilled part, painted as a background so a partial block runs straight into it.
+# Bright black from the terminal's own palette, which themes keep a mid grey on dark and
+# light backgrounds alike: palette 0 is near-black in most light themes, and a fixed
+# 256-colour grey turns into a black slab on a light background.
+BAR_TRACK = "\033[100m"
 SEP = f"{DIM}  │  {RESET}"
 SEP_NARROW = f"{DIM} │ {RESET}"
 
@@ -563,9 +567,12 @@ def usage_color(pct, pace):
     return GREEN
 
 
-def bar(pct, cells):
-    filled = min(cells, max(0, round(pct / 100 * cells)))
-    return BAR_FULL * filled + BAR_EMPTY * (cells - filled)
+def bar(pct, cells, color):
+    """`cells` columns filled to `pct` in eighths of a cell, on the track: 8 cells, 64 steps."""
+    eighths = min(cells * 8, max(0, round(pct / 100 * cells * 8)))
+    full, part = divmod(eighths, 8)
+    body = "█" * full + (BAR_EIGHTHS[part] if part else "")
+    return f"{BAR_TRACK}{color}{body.ljust(cells)}{RESET}"
 
 
 def countdown(resets_at, now):
@@ -583,27 +590,32 @@ def countdown(resets_at, now):
     return f"{minutes}m"
 
 
-def window(label, name, data, was_seen, now, layout):
-    """One rate-limit window: `5h ████░░░░  47% ·2h13m`, or `wk … 62% →104% ·2d4h` when hot.
+def window(name, data, was_seen, now, layout):
+    """One rate-limit window: `███▊      47% ·2h13m`, or `… 62% →104% ·2d4h` when hot.
+
+    Unlabelled: the 5-hour window is always the first of the two and the weekly one the
+    second, and their countdowns read apart by unit (`2h13m` against `2d4h`). A `5h`/`wk`
+    label cost six columns across the pair for something the position already says.
 
     The projection (weekly only, see PROJECTED) survives every layout step: on a narrow
     terminal it is the one figure that says whether to slow down, so a countdown or the
     bar goes first.
     """
     cells = layout["bar"]
+    track = f"{bar(0, cells, '')} " if cells else ""
     if data is None:
         if was_seen:
             # The window rolled over, so its old figure is gone and usage restarted at ~0.
-            empty = f"{GREEN}{BAR_EMPTY * cells}{RESET} " if cells else ""
-            return f"{DIM}{label}{RESET} {empty}{DIM}~0%{RESET}"
-        empty = f" {BAR_EMPTY * cells} " if cells else ""
-        return f"{DIM}{label}{empty} --{RESET}"
+            return f"{track}{DIM}~0%{RESET}"
+        return f"{track}{DIM}--{RESET}"
     pct = data["used_percentage"]
     pace = projected(data, WINDOW_SECONDS[name], now)
     color = usage_color(pct, pace)
-    # Padded to three digits beside a bar so the bar does not jump as the figure grows.
-    figure = f"{bar(pct, cells)} {pct:3.0f}%" if cells else f"{pct:.0f}%"
-    cell = f"{DIM}{label}{RESET} {color}{figure}{RESET}"
+    if cells:
+        # Padded to three digits beside a bar so the bar does not jump as the figure grows.
+        cell = f"{bar(pct, cells, color)} {color}{pct:3.0f}%{RESET}"
+    else:
+        cell = f"{color}{pct:.0f}%{RESET}"
     if name in PROJECTED and pace >= PACE_WARN and round(pace) > round(pct):
         cell += f" {color}→{min(pace, 999):.0f}%{RESET}"
     if name in layout["countdown"]:
@@ -681,8 +693,8 @@ def render(layout, info, now, columns):
         if info["effort"] and layout["effort"]:
             model_cell += f" {DIM}{info['effort']}{RESET}"
         cells.append(model_cell)
-    for label, name in (("5h", "five_hour"), ("wk", "seven_day")):
-        cells.append(window(label, name, info["usage"].get(name), info["seen"][name], now, layout))
+    for name in WINDOWS:  # 5-hour first, weekly second: the order is all that labels them
+        cells.append(window(name, info["usage"].get(name), info["seen"][name], now, layout))
 
     sep = layout["sep"]
     room = columns - printed_width(sep.join(cells))

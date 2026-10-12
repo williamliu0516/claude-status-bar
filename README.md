@@ -5,7 +5,7 @@ folder, the git branch, the model and effort level, and — the part that takes 
 5-hour and weekly usage that is actually correct.
 
 ```
-we-rewrite-compact  │  rewrite-0809-integrated  │  Opus 5.5 1M xhigh  │  5h ██░░░░░░  24% ·1h43m  │  wk ██████░░  70% →120% ·2d22h
+we-rewrite-compact  │  rewrite-0809-integrated  │  Opus 5.5 1M xhigh  │  █▉        24% ·1h43m  │  █████▋    70% →120% ·2d22h
 ```
 
 ## Install
@@ -59,8 +59,11 @@ Claude's commit and PR attribution back.
 | branch | current git branch, `@a1b2c3d` when HEAD is detached, hidden outside a repo |
 | model | `display_name`, with `(1M context)` shortened to `1M` |
 | effort | current effort level, when set |
-| `5h` | 5-hour usage window: bar, percentage, time until reset |
-| `wk` | weekly usage window, same |
+| 5-hour | first usage cell: bar (to an eighth of a cell, on a grey track), percentage, time until reset |
+| weekly | second usage cell, same |
+
+The usage cells carry no `5h`/`wk` label: the 5-hour window is always first, and the
+countdowns read apart by unit (`1h43m` against `2d22h`).
 
 Bars are coloured by pace, not by how much is spent: the figure each window is on course to
 reach by its reset if the rest of it burns at the average rate so far. Green below 80%,
@@ -101,8 +104,8 @@ A stale snapshot can therefore neither pull the number backwards nor revive a de
 ### Switching accounts
 
 That same rule would make a previous login's figures permanent: whichever account read
-higher, or has the later boundary, wins until its window ends — a week, for `wk`. So every
-observation is attributed to an account:
+higher, or has the later boundary, wins until its window ends — a week, for the weekly
+window. So every observation is attributed to an account:
 
 - The shared cache is stamped with `oauthAccount.accountUuid` from `~/.claude.json` and
   thrown away when that changes, poll backoff included, so the new account is fetched on
@@ -124,7 +127,7 @@ Two details that are easy to get wrong:
 - **The `limits[]` array is deliberately ignored.** It carries a second weekly figure — a
   model-scoped cap that can read 75% while the flat `seven_day` key reads 70% — but the two
   have *different denominators*. Combining them produces a number that matches neither, and
-  disagrees with what `/usage` reports. `5h` and `wk` are exactly `five_hour` and
+  disagrees with what `/usage` reports. The two usage cells are exactly `five_hour` and
   `seven_day`, nothing else, so the bar and `/usage` always tell the same story.
 
 ## Why it runs every second
