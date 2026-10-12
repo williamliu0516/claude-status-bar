@@ -5,7 +5,7 @@ folder, the git branch, the model and effort level, and — the part that takes 
 5-hour and weekly usage that is actually correct.
 
 ```
-we-rewrite-compact  │  rewrite-0809-integrated  │  Opus 5.5 1M xhigh  │  █▉        24% ·1h43m  │  █████▋    70% →120% ·2d22h
+we-rewrite-compact  │  rewrite-0809-integrated  │  Opus 5.5 1M xhigh  │  ██░░░░░░  24% ·1h43m  │  ██████░░  70% →120% ·2d22h
 ```
 
 ## Install
@@ -59,7 +59,7 @@ Claude's commit and PR attribution back.
 | branch | current git branch, `@a1b2c3d` when HEAD is detached, hidden outside a repo |
 | model | `display_name`, with `(1M context)` shortened to `1M` |
 | effort | current effort level, when set |
-| 5-hour | first usage cell: bar (to an eighth of a cell, on a grey track), percentage, time until reset |
+| 5-hour | first usage cell: bar, percentage, time until reset |
 | weekly | second usage cell, same |
 
 The usage cells carry no `5h`/`wk` label: the 5-hour window is always first, and the
