@@ -93,20 +93,26 @@ every session reads and writes:
 2. the session's own stdin payload
 3. the shared cache, carrying whatever any other session last observed
 
-They are merged by a rule that needs no trust in write order or clock skew:
+Every reading is stamped with when it was observed: the poll's request time, or the moment a
+session's payload last changed. Only an API response changes the payload, so that is when it
+was true. A payload never seen to change carries no stamp and is left out, since its session
+may have sat on it for hours. Readings are then merged by:
 
 1. Discard any window whose `resets_at` has passed, or is implausibly far ahead.
 2. Prefer the observation with the latest `resets_at` — a later boundary is a newer window.
-3. Within that window take the **largest** utilization, since usage only grows until reset.
+3. Within that window the **newest** reading wins. Usage only grows until reset, so a newest
+   figure a few points under an older one is lag between sources and the higher one stands;
+   a bigger drop is a limit reset early, which keeps the boundary and zeroes the figure.
 
-A stale snapshot can therefore neither pull the number backwards nor revive a dead window.
+A stale snapshot can therefore neither pull the number backwards nor revive a dead window,
+and an early reset shows at the next reading. (Taking the largest figure in the window, as
+this once did, held the weekly bar at 70% after a reset to 2%, for the rest of the week.)
 
 ### Which account
 
-That same rule would let one login's figures override another's: whichever account reads
-higher, or has the later boundary, wins until its window ends — a week, for the weekly
-window. So every observation is attributed to the account that earned it, and the cache
-keeps one set of windows per account.
+Rule 2 would let one login's figures override another's: whichever account has the later
+boundary wins until its window ends — a week, for the weekly window. So every observation is
+attributed to the account that earned it, and the cache keeps one set of windows per account.
 
 The account is **not** `oauthAccount` in `~/.claude.json`. That file is shared by every
 Claude Code process on the machine, but the login each one uses depends on where it runs.
@@ -127,8 +133,10 @@ the session sends; it is looked up again every 10 seconds, so a switch shows wit
 
 A session's stdin payload names no account and lags a switch: it holds whatever the last API
 response said. After a switch it is set aside until it changes, and even then it counts only
-for windows the poll has seen for the same account — two accounts' five-hour windows can
-close on the same minute, so boundaries alone cannot tell them apart.
+when its weekly window is the one the poll saw for the same account. The weekly boundary
+stays put for an account's whole week, so it tells two accounts apart where five-hour
+boundaries cannot (two can close on the same minute), and it lets a new five-hour window
+through before the poll has seen it, which matters when the usage endpoint answers 429.
 
 ### Account in a tmux status bar
 

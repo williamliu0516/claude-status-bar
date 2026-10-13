@@ -30,17 +30,27 @@ sessions read and write:
   2. this session's stdin payload
   3. the shared cache below, carrying whatever any other session last observed
 
-They are merged by a rule that needs no trust in write order or clock skew:
+Every reading is stamped `at` the moment it was observed: the poll's request time, or when
+a session's payload last changed -- nothing but a response changes it, so that is when it
+was true. A payload not yet seen to change has no such moment, since its session may have
+sat on it for hours, and is left out until it does (see `observe`). Readings are then
+merged by:
 
   1. Discard any window whose `resets_at` is already past, or implausibly far ahead.
   2. Prefer the observation with the latest `resets_at`; a later boundary is a newer window.
-  3. Within that window take the LARGEST utilization, since usage only grows until reset.
+  3. Within that window the newest reading wins. Usage only grows until the reset, so a
+     newest figure slightly below an older one is lag between sources and the higher one
+     stands -- but a limit reset early keeps the boundary and zeroes the figure, so a drop
+     of more than RESET_DROP is taken for one.
 
-A stale snapshot therefore can neither pull the number backwards nor revive a dead window.
+A stale snapshot therefore can neither pull the number backwards nor revive a dead window,
+and an early reset shows at the next reading. (The rule this replaced took the largest
+figure within the latest boundary, with no stamps: after the 2026-10-13 reset it held
+weekly at 70% while the account read 2%, and would have until the week ran out.)
 
-The same rule makes one login's readings outrank another's -- a higher figure or a later
-boundary wins for up to a week -- so everything is attributed to the account that earned
-it, and the cache keeps one set of windows per account.
+A later boundary would also make one login's readings outrank another's for up to a week,
+so everything is attributed to the account that earned it, and the cache keeps one set of
+windows per account.
 
 Which account that is
 ---------------------
@@ -58,7 +68,7 @@ session does, and asks GET /api/oauth/profile once per token whose it is (see `i
 Claude Code re-reads its credentials when they change on disk, so that token is the one
 the session sends. The payload names no account and lags a switch -- it holds what the
 last response said -- so it is credited only once it has changed since the switch, and
-only to windows the poll has seen for the same account.
+only when its weekly window is the one the poll saw for the same account (see `anchored`).
 
 Why it has to be fast
 ---------------------
@@ -116,6 +126,9 @@ FAILURE_BACKOFF = 120.0
 THROTTLED_BACKOFF = 300.0
 LOCK_STALE = 120.0
 WINDOW_TOLERANCE = 120.0
+# Percentage points a newer reading of the same window must fall by to count as an early
+# reset rather than lag between the poll and the response headers.
+RESET_DROP = 5.0
 MAX_WINDOW = 8 * 86400
 SESSION_TTL = 7 * 86400
 MAX_SESSIONS = 256
@@ -191,25 +204,49 @@ def plausible(entry, now):
     return entry is not None and now < entry["resets_at"] <= now + MAX_WINDOW
 
 
-def merge(entries, now):
-    """Best current estimate for one window, given observations of unknown age.
+def reading(entry, now):
+    """An observation as merged: {used_percentage, resets_at, at}, {idle, at}, or None.
+
+    `at` is when it was observed; one stored before readings carried it counts as oldest.
+    An idle one is the poll finding no window running, which outranks older figures too.
+    """
+    if not isinstance(entry, dict):
+        return None
+    at = entry.get("at")
+    at = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
+    if entry.get("idle") is True:
+        return {"idle": True, "at": at}
+    found = normalize(entry)
+    return dict(found, at=at) if plausible(found, now) else None
+
+
+def fold(one, other):
+    """The better of two readings of one window (see the module docstring for the rule).
 
     Boundaries are compared with a tolerance because each response recomputes `resets_at`
     at its own sub-second precision -- the same 03:20:00 window arrives as ...800.997,
-    ...800.225 and ...800.027 from the three sources. Exact grouping reads that drift as
-    three different windows and throws away every observation but one, freezing the number.
-    A real rollover moves the boundary by hours, so no tolerance this small can merge two
-    genuinely different windows.
+    ...800.225 and ...800.027 from the three sources. Exact comparison reads that drift as
+    a newer window. A real rollover moves the boundary by hours, so no tolerance this small
+    can merge two genuinely different windows.
     """
-    live = [e for e in (normalize(x) for x in entries) if plausible(e, now)]
-    if not live:
-        return None
-    newest = max(e["resets_at"] for e in live)
-    current = [e for e in live if newest - e["resets_at"] <= WINDOW_TOLERANCE]
-    return {
-        "used_percentage": max(e["used_percentage"] for e in current),
-        "resets_at": newest,
-    }
+    newer, older = (one, other) if one["at"] >= other["at"] else (other, one)
+    if newer.get("idle") or older.get("idle"):
+        return newer
+    if abs(newer["resets_at"] - older["resets_at"]) > WINDOW_TOLERANCE:
+        return newer if newer["resets_at"] > older["resets_at"] else older
+    if older["used_percentage"] - newer["used_percentage"] > RESET_DROP:
+        return newer
+    return dict(newer, used_percentage=max(newer["used_percentage"], older["used_percentage"]))
+
+
+def merge(entries, now):
+    """Best current estimate for one window, or None if nothing describes a running one."""
+    best = None
+    for entry in entries:
+        found = reading(entry, now)
+        if found is not None:
+            best = found if best is None else fold(best, found)
+    return best
 
 
 # ----------------------------------------------------------------------------- store
@@ -277,41 +314,65 @@ def account_name(accounts, account):
     return label if isinstance(label, str) and label else None
 
 
-def track_session(cache, accounts, session_id, limits, now):
-    """The account this session bills, and the part of its payload that may be credited to it.
+def observe(seen, limits, now, switched):
+    """The payload's windows, each stamped `at` with when its response arrived, else None.
 
-    Returns (account, limits, unidentified). The login is looked up again every
+    `seen` is what this session's previous render recorded. Claude Code rewrites every
+    window from each response's headers, so when any of them changes or appears, a response
+    has just arrived and all of them are as of now -- an unchanged weekly figure included.
+    One dropping out is no news: Claude Code removes a window once its boundary passes.
+
+    With nothing recorded -- a new session, or one that predates the stamps -- nobody saw
+    the windows arrive, and after a login switch they still hold what the last response
+    said under the old login. Either way they get no stamp until the next change.
+    """
+    windows = {name: normalize(limits.get(name)) for name in WINDOWS}
+    windows = {name: found for name, found in windows.items() if found is not None}
+    if not isinstance(seen, dict) or switched:
+        return {name: dict(found, at=None) for name, found in windows.items()}
+
+    def unchanged(name, found):
+        before = sub_dict(seen, name)
+        return (before.get("used_percentage"), before.get("resets_at")) == (
+            found["used_percentage"],
+            found["resets_at"],
+        )
+
+    if all(unchanged(name, found) for name, found in windows.items()):
+        return {name: dict(found, at=seen[name].get("at")) for name, found in windows.items()}
+    return {name: dict(found, at=now) for name, found in windows.items()}
+
+
+def track_session(cache, accounts, session_id, limits, now):
+    """The account this session bills, and the readings its payload may be credited with.
+
+    Returns (account, readings, unidentified). The login is looked up again every
     IDENTITY_SECONDS and kept in the session's record in between. A token nobody has
     identified yet -- every refresh mints one -- leaves the previous account in place, and
     `unidentified` asks for a poll child to find out whose it is.
 
-    On a switch the payload still holds what the last response said, under the old login,
-    so it is set aside until it changes: any API call after the switch rewrites it.
+    `readings` are the payload windows `observe` could stamp; without a session id there
+    is no record to watch them change in, so there are none.
     """
     sessions = sub_dict(cache, "sessions")
     record = sessions.get(session_id) if session_id else None
-    record = dict(record) if isinstance(record, dict) else None
-    signature = json.dumps(limits, sort_keys=True)
-    unidentified = False
-    checked = record.get("checked") if record else None
+    record = dict(record) if isinstance(record, dict) else {}
+    unidentified = switched = False
+    checked = record.get("checked")
     if not isinstance(checked, (int, float)) or not 0 <= now - checked < IDENTITY_SECONDS:
         token = stored_login().get("accessToken")
         account = known_account(accounts, token) if token else None
-        previous = record.get("account") if record else None
+        previous = record.get("account")
         if token and account is None:
             unidentified = True
             account = previous
-        if record is None:
-            record = {"account": account, "stale": None}
-        elif previous is not None and account is not None and account != previous:
-            record = {"account": account, "stale": signature}
-        else:
-            record["account"] = account
+        switched = previous is not None and account is not None and account != previous
+        record["account"] = account
         # An unidentified token is looked at again in two seconds, by when the poll child
         # sent to identify it has usually answered.
         record["checked"] = now - (IDENTITY_SECONDS - 2) if unidentified else now
-    if record.get("stale") is not None and record["stale"] != signature:
-        record["stale"] = None
+    record["windows"] = observe(record.get("windows"), limits, now, switched)
+    record.pop("stale", None)  # the set-aside payload `observe` replaced
     if session_id:
         if session_id not in sessions:
             live = {
@@ -326,30 +387,37 @@ def track_session(cache, accounts, session_id, limits, now):
         sessions[session_id] = record
         cache["sessions"] = sessions
     account = record.get("account")
-    trusted = limits if record.get("stale") is None else {}
-    return (account if isinstance(account, str) else None), trusted, unidentified
+    readings = {
+        name: window for name, window in record["windows"].items() if window["at"] is not None
+    }
+    return (account if isinstance(account, str) else None), readings, unidentified
 
 
-def anchored(rate_limits, anchor, now):
-    """The payload's windows that agree with one the poll has seen for the same account.
+def anchored(readings, anchor, now):
+    """The payload readings that belong to the account the poll saw `anchor` for.
 
     The payload names no account. Within IDENTITY_SECONDS of a switch, or when Claude Code
     and this script resolve a login differently, it can describe someone else's windows,
-    and window boundaries alone cannot tell -- two accounts' five-hour windows can close on
-    the same minute. Requiring the poll to have seen the window costs nothing when they
-    agree: the payload still lifts the figure between polls, which is what it is for.
+    and a five-hour boundary alone cannot tell -- two accounts' five-hour windows can close
+    on the same minute. The weekly one can: it stays put for the account's whole week. So a
+    payload whose weekly window is the one the poll saw is credited in full, including a
+    five-hour window the poll has not seen yet -- a new one, or one an early reset moved,
+    which would otherwise wait for the next poll that gets through, and the endpoint has
+    answered 429 with an hour's Retry-After. Short of that, each window must match its own.
     """
-    kept = {}
-    for name in WINDOWS:
-        entry = normalize(rate_limits.get(name))
-        reading = normalize(anchor.get(name))
-        if (
+
+    def agrees(name):
+        entry = normalize(readings.get(name))
+        known = normalize(anchor.get(name))
+        return (
             plausible(entry, now)
-            and plausible(reading, now)
-            and abs(reading["resets_at"] - entry["resets_at"]) <= WINDOW_TOLERANCE
-        ):
-            kept[name] = rate_limits[name]
-    return kept
+            and plausible(known, now)
+            and abs(known["resets_at"] - entry["resets_at"]) <= WINDOW_TOLERANCE
+        )
+
+    if agrees("seven_day"):
+        return dict(readings)
+    return {name: readings[name] for name in WINDOWS if agrees(name)}
 
 
 def write_json(path, data):
@@ -473,6 +541,26 @@ def identify(token, now):
     return uuid
 
 
+def polled(response, now):
+    """The usage endpoint's windows as readings observed `now`.
+
+    A window it lists with nothing running -- no usage since it last closed, or since an
+    early reset -- becomes an idle reading, so the figure it replaces does not linger until
+    its old boundary. One it does not list at all says nothing.
+    """
+    readings = {}
+    for name in WINDOWS:
+        if not isinstance(response, dict) or name not in response:
+            continue
+        entry = response[name]
+        found = normalize(entry)
+        if found is not None:
+            readings[name] = dict(found, at=now)
+        elif entry is None or (isinstance(entry, dict) and entry.get("resets_at") is None):
+            readings[name] = {"idle": True, "at": now}
+    return readings
+
+
 def poll():
     """Refresh this context's account in the shared cache. Runs detached; output ignored."""
     import urllib.error
@@ -527,7 +615,7 @@ def poll():
         buckets = cache["accounts"]
         bucket = sub_dict(buckets, account)
         if fresh is not None:
-            bucket = blend_into_cache(bucket, [fresh], now)
+            bucket = blend_into_cache(bucket, [polled(fresh, now)], now)
             bucket.pop("retry_after", None)
         else:
             if not any(name in bucket for name in WINDOWS):
@@ -932,18 +1020,19 @@ def main():
     cache = load_cache()
     accounts = read_json(ACCOUNTS_PATH)
     limits = sub_dict(payload, "rate_limits")
-    account, trusted, unidentified = track_session(
+    account, readings, unidentified = track_session(
         cache, accounts, payload.get("session_id"), limits, now
     )
     if account is None:
         # No login to attribute anything to -- an API key, or a brand-new token not yet
-        # identified -- so there is no other account's reading to confuse it with.
+        # identified -- so there is no other account's reading to confuse it with, nor
+        # any other reading to be older than.
         previous, bucket = {}, None
-        usage = blend_into_cache({}, [trusted], now)
+        usage = blend_into_cache({}, [limits], now)
     else:
         # `previous` still holds a window that just ran out, which is how a rollover shows.
         previous = sub_dict(cache["accounts"], account)
-        usage = bucket = blend_into_cache(previous, [anchored(trusted, previous, now)], now)
+        usage = bucket = blend_into_cache(previous, [anchored(readings, previous, now)], now)
         cache["accounts"][account] = bucket
     if cache != stored:
         write_json(CACHE_PATH, cache)
@@ -961,9 +1050,11 @@ def main():
         "model": model,
         "effort": effort,
         "account": None if shown_by_tmux(accounts, now) else account_name(accounts, account),
-        "usage": usage,
+        # An idle window shows the same as one that just ran out: nothing spent since.
+        "usage": {name: usage[name] for name in WINDOWS if "resets_at" in usage.get(name, {})},
         "seen": {
-            name: any(normalize(c.get(name)) for c in (trusted, previous)) for name in WINDOWS
+            name: name in usage or any(normalize(c.get(name)) for c in (limits, previous))
+            for name in WINDOWS
         },
     }
     columns = terminal_columns()
