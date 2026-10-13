@@ -393,6 +393,8 @@ dl.spec dd {
   <dl class="spec">
     <dt>where</dt><dd>folder and git branch; the branch gives way first on a narrow terminal</dd>
     <dt>model</dt><dd>model and effort level</dd>
+    <dt>account</dt><dd>the login the session really bills, <code>personal</code> or the
+      organization's name; or once, in the tmux status bar</dd>
     <dt>5h&nbsp;/&nbsp;wk</dt><dd>usage bars with time until reset, coloured by the pace you are on
       rather than what is spent, kept current across every open session instead of each one's
       stale snapshot</dd>
@@ -407,8 +409,8 @@ dl.spec dd {
     alone; install with <code>CLAUDE_STATUSBAR_KEEP_ATTRIBUTION=1</code> to keep the co-author line.</p>
 
   <footer class="foot">
-    <small>Linux and macOS. On macOS the login is read from the Keychain, where Claude Code
-       keeps it. Switching accounts resets the bars to the new account.</small>
+    <small>Linux and macOS. The account shown is the login the session actually uses, read
+       from where Claude Code keeps it, and the bars are that account's alone.</small>
     <a class="quiet" href="https://github.com/williamliu0516/claude-status-bar">Source and documentation
        on GitHub</a>
   </footer>

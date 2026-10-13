@@ -1,11 +1,11 @@
 # claude-status-bar
 
 A status line for [Claude Code](https://claude.com/claude-code) that shows the working
-folder, the git branch, the model and effort level, and — the part that takes real work —
-5-hour and weekly usage that is actually correct.
+folder, the git branch, the model and effort level, the account the session is billing, and
+— the part that takes real work — 5-hour and weekly usage that is actually correct.
 
 ```
-we-rewrite-compact  │  rewrite-0809-integrated  │  Opus 5.5 1M xhigh  │  ██░░░░░░  24% ·1h43m  │  ██████░░  70% →120% ·2d22h
+we-rewrite-compact  │  rewrite-0809-integrated  │  Opus 5.5 1M xhigh  │  personal  │  ██░░░░░░  24% ·1h43m  │  ██████░░  70% →120% ·2d22h
 ```
 
 ## Install
@@ -59,6 +59,7 @@ Claude's commit and PR attribution back.
 | branch | current git branch, `@a1b2c3d` when HEAD is detached, hidden outside a repo |
 | model | `display_name`, with `(1M context)` shortened to `1M` |
 | effort | current effort level, when set |
+| account | the login this session actually uses: `personal` for an individual plan, else the organization's name (see [Which account](#which-account)) |
 | 5-hour | first usage cell: bar, percentage, time until reset |
 | weekly | second usage cell, same |
 
@@ -84,14 +85,13 @@ wk = 10/12/67/89 at the same instant, the extremes being snapshots from a previo
 and a previous week. `refreshInterval` re-runs the command but hands it that same frozen
 cache, so it cannot fix either problem.
 
-Usage is therefore resolved from four sources, newest-wins, shared through one file that
+Usage is therefore resolved from three sources, newest-wins, shared through one file that
 every session reads and writes:
 
-1. a live poll of `GET /api/oauth/usage`, throttled to one request per minute across every
-   session and run detached so rendering never waits on the network
+1. a live poll of `GET /api/oauth/usage`, throttled to one request per minute per account
+   and run detached so rendering never waits on the network
 2. the session's own stdin payload
-3. `cachedUsageUtilization` in `~/.claude.json`, which Claude Code maintains account-wide
-4. the shared cache, carrying whatever any other session last observed
+3. the shared cache, carrying whatever any other session last observed
 
 They are merged by a rule that needs no trust in write order or clock skew:
 
@@ -101,22 +101,49 @@ They are merged by a rule that needs no trust in write order or clock skew:
 
 A stale snapshot can therefore neither pull the number backwards nor revive a dead window.
 
-### Switching accounts
+### Which account
 
-That same rule would make a previous login's figures permanent: whichever account read
+That same rule would let one login's figures override another's: whichever account reads
 higher, or has the later boundary, wins until its window ends — a week, for the weekly
-window. So every observation is attributed to an account:
+window. So every observation is attributed to the account that earned it, and the cache
+keeps one set of windows per account.
 
-- The shared cache is stamped with `oauthAccount.accountUuid` from `~/.claude.json` and
-  thrown away when that changes, poll backoff included, so the new account is fetched on
-  the next render.
-- `cachedUsageUtilization` counts only while its own `accountUuid` matches; Claude Code
-  does not clear it on a switch.
-- A session's stdin payload names no account, and a session already running keeps the
-  token it started with. Its payload counts only if the session first rendered under the
-  current account **and** each window matches one the poll or `~/.claude.json` has seen
-  for that account. Both checks are needed: two accounts' five-hour windows can close on
-  the same minute, so boundaries alone cannot tell them apart.
+The account is **not** `oauthAccount` in `~/.claude.json`. That file is shared by every
+Claude Code process on the machine, but the login each one uses depends on where it runs.
+Claude Code reads `CLAUDE_CODE_OAUTH_TOKEN`, then the Keychain, then
+`~/.claude/.credentials.json`, and a process that cannot reach the login Keychain — every
+pane of a tmux server started over ssh or mosh — is refused and falls through to the file.
+So one Mac can bill two accounts at once, one for the windows on its own screen and one for
+everything inside that tmux, while `~/.claude.json` names whichever logged in last. Its
+`cachedUsageUtilization` is no better: Claude Code stamps it with that same `oauthAccount`,
+whichever token fetched it.
+
+So the status line resolves the token the same way, from its own process — a child of the
+session, so it lands where the session does — and asks `GET /api/oauth/profile` whose it is,
+once per token (about every eight hours, as tokens are refreshed). Only a digest of the token
+is kept, in `~/.claude/statusline-accounts.json`, next to the account's short name and email.
+Claude Code re-reads its credentials when they change on disk, so the token found is the one
+the session sends; it is looked up again every 10 seconds, so a switch shows within that.
+
+A session's stdin payload names no account and lags a switch: it holds whatever the last API
+response said. After a switch it is set aside until it changes, and even then it counts only
+for windows the poll has seen for the same account — two accounts' five-hour windows can
+close on the same minute, so boundaries alone cannot tell them apart.
+
+### Account in a tmux status bar
+
+With several Claude Code panes in one tmux, the account cell repeats in every pane. A tmux
+`#(...)` job runs in the tmux server's context, the same as its panes, so it resolves the
+same login:
+
+```tmux
+set -ag status-right '#(python3 ~/.claude/statusline.py --account --tmux "#{socket_path}")'
+```
+
+`--account` prints the short name alone. With `--tmux` it also records that this tmux server
+shows it, and the status lines in that server's panes then leave their own account cell out.
+If the bar stops reporting — the line removed, the server gone — the cell comes back within a
+minute.
 
 Two details that are easy to get wrong:
 
@@ -155,18 +182,18 @@ minute no matter how often the line redraws.
 - Claude Code draws the line on one row and cuts the overflow from the end, which is where
   the weekly bar sits. So the line sheds detail in a fixed order until it fits: tighter
   separators, then the branch, the bars from eight cells to four to none, the weekly and then
-  the 5-hour countdown, effort, folder and model; the percentages and the projection go
-  last. The width it fits is `COLUMNS` minus 4 — the line sits in a box padded
+  the 5-hour countdown, effort, account, folder and model; the percentages and the projection
+  go last. The width it fits is `COLUMNS` minus 4 — the line sits in a box padded
   two columns each side, and sizing to the full terminal loses the last cells to a `…`.
 - The branch cell is sized to whatever the other cells leave, down to ten columns.
   Long names are elided from the middle: `rewrite-0809-integrated` and
   `rewrite-0809-integrated-compact` differ only in the suffix, so trimming the tail would
   render two different branches identically.
-- Credentials are read, never written, from where Claude Code keeps them: the Keychain on
-  macOS, then `~/.claude/.credentials.json`. The file is only a fallback there — Claude Code
-  writes it when the Keychain is locked, over ssh for instance, and never removes it, so it
-  is often an expired token or a previous account's. Refreshing the OAuth token is Claude
-  Code's job; on 401 this backs off and keeps rendering from cache.
+- Credentials are read, never written, from where Claude Code keeps them, in its order (see
+  [Which account](#which-account)). On macOS the file is only a fallback — Claude Code writes
+  it when the Keychain is locked, over ssh for instance, and never removes it, so it can
+  hold another account than the Keychain. Refreshing the OAuth token is Claude Code's job; on
+  401 this backs off and keeps rendering from cache.
 
 ## Environment variables
 

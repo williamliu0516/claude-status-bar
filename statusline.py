@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Claude Code status line: folder, git branch, model, effort, 5h + weekly usage.
+"""Claude Code status line: folder, git branch, model, effort, account, 5h + weekly usage.
 
 Reads the status line JSON payload on stdin (schema: `claude` 2.1.x), prints one line.
 
@@ -22,14 +22,13 @@ instant, the extremes being snapshots from a previous window and a previous week
 `refreshInterval` re-runs this command but hands it that same frozen cache, so it cannot
 fix either problem.
 
-So usage is resolved from four sources, newest-wins, and shared through one file that all
+So usage is resolved from three sources, newest-wins, and shared through one file that all
 sessions read and write:
 
-  1. a live poll of GET /api/oauth/usage, throttled to one request per POLL_SECONDS across
-     every session and run detached so rendering never waits on the network
+  1. a live poll of GET /api/oauth/usage, throttled to one request per POLL_SECONDS for
+     each account and run detached so rendering never waits on the network
   2. this session's stdin payload
-  3. `cachedUsageUtilization` in ~/.claude.json, which Claude Code maintains account-wide
-  4. the shared cache below, carrying whatever any other session last observed
+  3. the shared cache below, carrying whatever any other session last observed
 
 They are merged by a rule that needs no trust in write order or clock skew:
 
@@ -39,12 +38,27 @@ They are merged by a rule that needs no trust in write order or clock skew:
 
 A stale snapshot therefore can neither pull the number backwards nor revive a dead window.
 
-The same rule makes every reading from a previous login permanent -- a higher figure or a
-later boundary outranks the new account's for up to a week -- so everything is attributed
-to an account. The cache is stamped with `oauthAccount.accountUuid` and discarded when it
-changes, ~/.claude.json's figures count only when stamped with the same account, and a
-session's payload only when that session started under it and its window matches one the
-account is known to have.
+The same rule makes one login's readings outrank another's -- a higher figure or a later
+boundary wins for up to a week -- so everything is attributed to the account that earned
+it, and the cache keeps one set of windows per account.
+
+Which account that is
+---------------------
+Not the one in ~/.claude.json. That file is shared by every Claude Code process on the
+machine, but the login each one uses depends on where it runs: Claude Code reads
+CLAUDE_CODE_OAUTH_TOKEN, then the Keychain, then ~/.claude/.credentials.json, and a process
+that cannot reach the login Keychain -- every pane of a tmux server started over ssh or
+mosh -- is refused and falls through to the file. So one Mac can bill two accounts at once,
+one for the windows on its own screen and one for everything inside that tmux, while
+`oauthAccount` names whichever logged in last. Its `cachedUsageUtilization` is no help
+either: Claude Code stamps it with `oauthAccount`, whichever token fetched it.
+
+So this resolves the token the same way from its own process, which runs where its
+session does, and asks GET /api/oauth/profile once per token whose it is (see `identify`).
+Claude Code re-reads its credentials when they change on disk, so that token is the one
+the session sends. The payload names no account and lags a switch -- it holds what the
+last response said -- so it is credited only once it has changed since the switch, and
+only to windows the poll has seen for the same account.
 
 Why it has to be fast
 ---------------------
@@ -56,9 +70,13 @@ subprocess imports are deferred into the paths that actually use them: `urllib.r
 alone costs 47 ms, three times the work of a whole render, and only the detached poll child
 ever needs it.
 
-Credentials are read, never written, from where Claude Code keeps them: the Keychain on
-macOS, then ~/.claude/.credentials.json. Refreshing the OAuth token is Claude Code's job;
-on 401 this backs off and keeps rendering from cache.
+Credentials are read, never written. Refreshing the OAuth token is Claude Code's job; on
+401 this backs off and keeps rendering from cache.
+
+`--account` prints the account's short name alone, for a tmux status bar: `#(...)` jobs run
+in the tmux server's context, the same as its panes, so they resolve the same login. Given
+`--tmux '#{socket_path}'` it also records that this server shows it, and status lines in
+that server's panes leave their own account cell out rather than repeat it in every pane.
 """
 
 import json
@@ -78,7 +96,7 @@ ANSI = re.compile(r"\033\[[0-9;]*m")
 
 CACHE_PATH = os.path.expanduser("~/.claude/statusline-usage.json")
 LOCK_PATH = CACHE_PATH + ".lock"
-CONFIG_PATH = os.path.expanduser("~/.claude.json")
+ACCOUNTS_PATH = os.path.expanduser("~/.claude/statusline-accounts.json")
 CREDENTIALS_PATH = os.path.expanduser("~/.claude/.credentials.json")
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 SETTINGS_PATH = os.path.expanduser("~/.claude/settings.json")
@@ -89,6 +107,7 @@ NO_ATTRIBUTION = {"commit": "", "pr": "", "sessionUrl": False}
 KEEP_ATTRIBUTION = os.environ.get("CLAUDE_STATUSBAR_KEEP_ATTRIBUTION", "0") != "0"
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 OAUTH_BETA = "oauth-2025-04-20"
 POLL_SECONDS = float(os.environ.get("CLAUDE_STATUSLINE_POLL_SECONDS", "60"))
 POLL_ENABLED = os.environ.get("CLAUDE_STATUSLINE_POLL", "1") != "0"
@@ -100,6 +119,13 @@ WINDOW_TOLERANCE = 120.0
 MAX_WINDOW = 8 * 86400
 SESSION_TTL = 7 * 86400
 MAX_SESSIONS = 256
+# How often a session looks up its login again. A Keychain read is a 24 ms subprocess, as
+# much as the rest of a render, so not every second; a switch shows within this long.
+IDENTITY_SECONDS = 10.0
+MAX_TOKENS = 32
+# A tmux bar that stopped reporting (old config, server gone) hands the cell back this soon.
+TMUX_SHOWN_SECONDS = 60.0
+ACCOUNT_CELLS = 16
 WINDOWS = ("five_hour", "seven_day")
 WINDOW_SECONDS = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}
 PACE_FLOOR = 0.15
@@ -209,107 +235,134 @@ def sub_dict(mapping, key):
     return value if isinstance(value, dict) else {}
 
 
-def current_account(config):
-    """The logged-in account's UUID from ~/.claude.json, or None when there is no login."""
-    uuid = sub_dict(config, "oauthAccount").get("accountUuid")
+def load_cache():
+    """The shared cache: one set of windows per account, and what each session runs on.
+
+    Anything else in the file -- the single-account layout this replaced, stamped from
+    ~/.claude.json -- is dropped on the next write.
+    """
+    raw = read_json(CACHE_PATH)
+    return {"accounts": sub_dict(raw, "accounts"), "sessions": sub_dict(raw, "sessions")}
+
+
+def known_account(accounts, token):
+    """The account UUID `identify` recorded for `token`, or None if it has not seen it yet."""
+    entry = sub_dict(sub_dict(accounts, "tokens"), token_key(token))
+    uuid = entry.get("account")
     return uuid if isinstance(uuid, str) and uuid else None
 
 
-def account_cache(account):
-    """The shared cache, or a fresh one when it was written for a different account.
+def token_key(token):
+    """A short digest to file a token under. The token itself is never written anywhere."""
+    import hashlib
 
-    Every figure in it is a max over observations, so a window left over from the account
-    you just switched away from is not merely stale: if it reads higher, or resets later,
-    it outranks every reading of the new account until its own window expires -- a week,
-    for the weekly bar. The poll bookkeeping goes too, so the new account is fetched on the
-    next render rather than after the old one's backoff.
+    return hashlib.sha256(token.encode()).hexdigest()[:16]
+
+
+def account_label(profile):
+    """`personal` for an individual plan, else the organization's own name.
+
+    Claude.ai gives each individual subscriber an organization named "<email>'s
+    Organization"; a team or enterprise one carries the name its admin chose, which is what
+    tells two work accounts apart.
     """
-    cache = read_json(CACHE_PATH)
-    if cache.get("account") != account:
-        cache = {"account": account, "sessions": sub_dict(cache, "sessions")}
-    return cache
+    name = sub_dict(profile, "organization").get("name")
+    if not isinstance(name, str) or not name.strip() or name.endswith("'s Organization"):
+        return "personal"
+    return name.strip()
 
 
-def own_session(cache, session_id, account, now):
-    """Did this session start under `account`? Records it on first sight.
+def account_name(accounts, account):
+    label = sub_dict(sub_dict(accounts, "accounts"), account).get("label") if account else None
+    return label if isinstance(label, str) and label else None
 
-    A running session keeps the token it started with, so after a switch its payload goes
-    on describing the previous login -- and window boundaries alone cannot tell the two
-    apart, since both accounts' five-hour windows can close on the same minute. The
-    account current when a session first renders is the one it runs on, so that is
-    recorded once and trusted for the session's lifetime. A session that did pick up the
-    new login merely loses its payload; the poll and ~/.claude.json still cover it.
+
+def track_session(cache, accounts, session_id, limits, now):
+    """The account this session bills, and the part of its payload that may be credited to it.
+
+    Returns (account, limits, unidentified). The login is looked up again every
+    IDENTITY_SECONDS and kept in the session's record in between. A token nobody has
+    identified yet -- every refresh mints one -- leaves the previous account in place, and
+    `unidentified` asks for a poll child to find out whose it is.
+
+    On a switch the payload still holds what the last response said, under the old login,
+    so it is set aside until it changes: any API call after the switch rewrites it.
     """
-    if not isinstance(session_id, str) or not session_id:
-        return True
     sessions = sub_dict(cache, "sessions")
-    seen = sessions.get(session_id)
-    if not isinstance(seen, list) or len(seen) != 2:
-        live = {
-            key: value
-            for key, value in sessions.items()
-            if isinstance(value, list)
-            and len(value) == 2
-            and isinstance(value[1], (int, float))
-            and now - value[1] < SESSION_TTL
-        }
-        newest = sorted(live.items(), key=lambda item: item[1][1])[-(MAX_SESSIONS - 1) :]
-        seen = [account, now]
-        cache["sessions"] = dict(newest, **{session_id: seen})
-    return seen[0] == account
+    record = sessions.get(session_id) if session_id else None
+    record = dict(record) if isinstance(record, dict) else None
+    signature = json.dumps(limits, sort_keys=True)
+    unidentified = False
+    checked = record.get("checked") if record else None
+    if not isinstance(checked, (int, float)) or not 0 <= now - checked < IDENTITY_SECONDS:
+        token = stored_login().get("accessToken")
+        account = known_account(accounts, token) if token else None
+        previous = record.get("account") if record else None
+        if token and account is None:
+            unidentified = True
+            account = previous
+        if record is None:
+            record = {"account": account, "stale": None}
+        elif previous is not None and account is not None and account != previous:
+            record = {"account": account, "stale": signature}
+        else:
+            record["account"] = account
+        # An unidentified token is looked at again in two seconds, by when the poll child
+        # sent to identify it has usually answered.
+        record["checked"] = now - (IDENTITY_SECONDS - 2) if unidentified else now
+    if record.get("stale") is not None and record["stale"] != signature:
+        record["stale"] = None
+    if session_id:
+        if session_id not in sessions:
+            live = {
+                key: value
+                for key, value in sessions.items()
+                if isinstance(value, dict)
+                and isinstance(value.get("checked"), (int, float))
+                and now - value["checked"] < SESSION_TTL
+            }
+            newest = sorted(live.items(), key=lambda item: item[1]["checked"])
+            sessions = dict(newest[-(MAX_SESSIONS - 1) :])
+        sessions[session_id] = record
+        cache["sessions"] = sessions
+    account = record.get("account")
+    trusted = limits if record.get("stale") is None else {}
+    return (account if isinstance(account, str) else None), trusted, unidentified
 
 
-def config_usage(config, account):
-    """`cachedUsageUtilization` from ~/.claude.json, when it belongs to `account`.
+def anchored(rate_limits, anchor, now):
+    """The payload's windows that agree with one the poll has seen for the same account.
 
-    Claude Code stamps it with the account it was fetched for, and does not clear it on a
-    switch; until it next refreshes, it still describes the previous login.
+    The payload names no account. Within IDENTITY_SECONDS of a switch, or when Claude Code
+    and this script resolve a login differently, it can describe someone else's windows,
+    and window boundaries alone cannot tell -- two accounts' five-hour windows can close on
+    the same minute. Requiring the poll to have seen the window costs nothing when they
+    agree: the payload still lifts the figure between polls, which is what it is for.
     """
-    cached = sub_dict(config, "cachedUsageUtilization")
-    owner = cached.get("accountUuid")
-    if owner is not None and owner != account:
-        return {}
-    return sub_dict(cached, "utilization")
-
-
-def anchored(rate_limits, anchors, account, now):
-    """The payload's windows that agree with a reading known to be this account's.
-
-    The payload names no account, and a session keeps the one it started with in memory
-    -- it goes on billing, and reporting, the previous login for hours after a switch made
-    in another window. So each of its windows is kept only when an attributable source
-    (the poll, ~/.claude.json) has seen the same window. That costs nothing when it
-    agrees: the payload still lifts the figure between polls, which is what it is for.
-    With no login to attribute anything to there is nothing to confuse it with.
-    """
-    if account is None:
-        return rate_limits
     kept = {}
     for name in WINDOWS:
         entry = normalize(rate_limits.get(name))
-        if not plausible(entry, now):
-            continue
-        for anchor in (normalize(a.get(name)) for a in anchors):
-            if (
-                plausible(anchor, now)
-                and abs(anchor["resets_at"] - entry["resets_at"]) <= WINDOW_TOLERANCE
-            ):
-                kept[name] = rate_limits[name]
-                break
+        reading = normalize(anchor.get(name))
+        if (
+            plausible(entry, now)
+            and plausible(reading, now)
+            and abs(reading["resets_at"] - entry["resets_at"]) <= WINDOW_TOLERANCE
+        ):
+            kept[name] = rate_limits[name]
     return kept
 
 
-def write_cache(data):
+def write_json(path, data):
     """Atomic replace. A lost race between sessions self-heals on the next render.
 
     The temp file is same-directory and pid-suffixed so `os.replace` stays atomic without
     dragging `tempfile` into the render path.
     """
-    tmp = f"{CACHE_PATH}.{os.getpid()}.tmp"
+    tmp = f"{path}.{os.getpid()}.tmp"
     try:
         with open(tmp, "w") as handle:
             json.dump(data, handle)
-        os.replace(tmp, CACHE_PATH)
+        os.replace(tmp, path)
     except OSError:
         try:
             os.unlink(tmp)
@@ -332,15 +385,18 @@ def blend_into_cache(cache, contributions, now):
 # ------------------------------------------------------------------------ live poll
 
 
-def oauth_token(now):
-    """The access token Claude Code is currently using, or None when there is no live one.
+def stored_login():
+    """The OAuth login Claude Code would use from this process's context, or {}.
 
-    On macOS Claude Code keeps its login in the Keychain and writes the plaintext file only
-    when the Keychain cannot be reached -- an ssh session, typically. That file is then
-    never cleaned up, so reading it first means polling with a token that expired long
-    ago, or with a previous account's. Resolve in the same order Claude Code does.
+    Claude Code's own order: CLAUDE_CODE_OAUTH_TOKEN, then on macOS the Keychain, then
+    ~/.claude/.credentials.json. Where this runs decides the answer -- a security session
+    that cannot reach the login Keychain gets exit 36 and falls through to the file, which
+    Claude Code wrote the last time it was in the same position, often for another account.
+    The status line runs as a child of its session, so it lands where its session does.
     """
-    blocks = []
+    token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    if token:
+        return {"accessToken": token}
     if sys.platform == "darwin":
         import subprocess
 
@@ -352,24 +408,74 @@ def oauth_token(now):
                 text=True,
                 timeout=5,
             )
-            blocks.append(json.loads(found.stdout).get("claudeAiOauth"))
+            block = json.loads(found.stdout).get("claudeAiOauth")
+            if isinstance(block, dict) and block.get("accessToken"):
+                return block
         except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
             pass
-    blocks.append(read_json(CREDENTIALS_PATH).get("claudeAiOauth"))
-    for block in blocks:
-        if not isinstance(block, dict) or not block.get("accessToken"):
-            continue
-        expires = block.get("expiresAt")
-        if isinstance(expires, (int, float)) and expires / 1000 <= now:
-            return None  # the current login's token; refreshing it is Claude Code's job
-        return block["accessToken"]
-    return None
+    block = read_json(CREDENTIALS_PATH).get("claudeAiOauth")
+    return block if isinstance(block, dict) and block.get("accessToken") else {}
+
+
+def live_token(login, now):
+    """The login's access token, or None once it has expired: refreshing is Claude Code's job."""
+    expires = login.get("expiresAt")
+    if isinstance(expires, (int, float)) and expires / 1000 <= now:
+        return None
+    return login.get("accessToken")
+
+
+def api_get(url, token):
+    """GET an OAuth endpoint and parse the JSON. Raises urllib/OS/JSON errors to the caller."""
+    import urllib.request
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": OAUTH_BETA,
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=8) as response:
+        return json.load(response)
+
+
+def identify(token, now):
+    """Ask whose `token` is, record the answer, and return the account UUID (None on failure).
+
+    One request per token, and an access token lives about eight hours. Only a digest of
+    the token is kept, next to the account's short name and email.
+    """
+    import urllib.error
+
+    try:
+        profile = api_get(PROFILE_URL, token)
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return None
+    account = sub_dict(profile, "account")
+    uuid = account.get("uuid")
+    if not isinstance(uuid, str) or not uuid:
+        return None
+    accounts = read_json(ACCOUNTS_PATH)
+    tokens = {
+        key: value
+        for key, value in sub_dict(accounts, "tokens").items()
+        if isinstance(value, dict) and isinstance(value.get("seen"), (int, float))
+    }
+    tokens[token_key(token)] = {"account": uuid, "seen": now}
+    newest = sorted(tokens.items(), key=lambda item: item[1]["seen"])[-MAX_TOKENS:]
+    accounts["tokens"] = dict(newest)
+    people = sub_dict(accounts, "accounts")
+    people[uuid] = {"label": account_label(profile), "email": account.get("email")}
+    accounts["accounts"] = people
+    write_json(ACCOUNTS_PATH, accounts)
+    return uuid
 
 
 def poll():
-    """Refresh the shared cache from the usage endpoint. Runs detached; output ignored."""
+    """Refresh this context's account in the shared cache. Runs detached; output ignored."""
     import urllib.error
-    import urllib.request
 
     try:
         fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -384,56 +490,59 @@ def poll():
         return
 
     now = time.time()
-    account = current_account(read_json(CONFIG_PATH))
     try:
+        token = live_token(stored_login(), now)
+        if not token:
+            return
+        account = known_account(read_json(ACCOUNTS_PATH), token) or identify(token, now)
+        if account is None:
+            return
         # Re-check under the lock. Children spawned while the previous poller held it would
         # otherwise each fire the moment it is released, turning one due refresh into a
         # burst of requests -- which is what earns a 429.
-        cache = account_cache(account)
-        if now - cache.get("polled_at", 0) < POLL_SECONDS or now < cache.get("retry_after", 0):
+        bucket = sub_dict(load_cache()["accounts"], account)
+        if now - bucket.get("polled_at", 0) < POLL_SECONDS or now < bucket.get("retry_after", 0):
             return
 
-        token = oauth_token(now)
-        if not token:
-            return
-        request = urllib.request.Request(
-            USAGE_URL,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "anthropic-beta": OAUTH_BETA,
-                "Content-Type": "application/json",
-            },
-        )
-        with urllib.request.urlopen(request, timeout=8) as response:
-            fresh = json.load(response)
-        cache = blend_into_cache(account_cache(account), [fresh], now)
-        cache["polled_at"] = now
-        cache.pop("retry_after", None)
-        write_cache(cache)
-    except (urllib.error.URLError, OSError, ValueError, TimeoutError) as error:
-        # Expired token, offline, throttled, or a bad response: stay quiet, serve cache.
-        # A 429 means we are asking too often, so back off harder than for a blip -- but
-        # not so hard that the figures go visibly stale, since ~/.claude.json keeps being
-        # refreshed by Claude Code itself and carries us through the gap.
-        status = getattr(error, "code", None)
-        backoff = THROTTLED_BACKOFF if status == 429 else FAILURE_BACKOFF
-        if status == 429:
-            headers = getattr(error, "headers", None)
-            retry_after = headers.get("retry-after") if headers else None
-            if retry_after and retry_after.strip().isdigit():
-                # A floor, never a replacement. This endpoint answers `Retry-After: 0`,
-                # which taken literally would cancel the backoff entirely and leave us
-                # asking again at every poll interval for as long as it keeps refusing.
-                backoff = max(backoff, float(retry_after.strip()))
-        cache = account_cache(account)
-        if not any(name in cache for name in WINDOWS):
-            # Nothing to serve in the meantime -- the first poll after an account switch,
-            # when the payload has no anchor and ~/.claude.json no figures yet. A long
-            # backoff here is five minutes of blank bars, so retry at the poll interval.
-            backoff = POLL_SECONDS
-        cache["polled_at"] = now
-        cache["retry_after"] = now + backoff
-        write_cache(cache)
+        fresh, backoff = None, None
+        try:
+            fresh = api_get(USAGE_URL, token)
+        except (urllib.error.URLError, OSError, ValueError, TimeoutError) as error:
+            # Expired token, offline, throttled, or a bad response: stay quiet, serve cache.
+            # A 429 means we are asking too often, so back off harder than for a blip -- but
+            # not so hard that the figures go visibly stale.
+            status = getattr(error, "code", None)
+            backoff = THROTTLED_BACKOFF if status == 429 else FAILURE_BACKOFF
+            if status == 429:
+                headers = getattr(error, "headers", None)
+                retry_after = headers.get("retry-after") if headers else None
+                if retry_after and retry_after.strip().isdigit():
+                    # A floor, never a replacement. This endpoint answers `Retry-After: 0`,
+                    # which taken literally would cancel the backoff entirely and leave us
+                    # asking again at every poll interval for as long as it keeps refusing.
+                    backoff = max(backoff, float(retry_after.strip()))
+
+        # Read again just before writing: sessions kept rendering while the request was out.
+        cache = load_cache()
+        buckets = cache["accounts"]
+        bucket = sub_dict(buckets, account)
+        if fresh is not None:
+            bucket = blend_into_cache(bucket, [fresh], now)
+            bucket.pop("retry_after", None)
+        else:
+            if not any(name in bucket for name in WINDOWS):
+                # Nothing to serve in the meantime -- an account's first poll. A long backoff
+                # here is five minutes of blank bars, so retry at the poll interval.
+                backoff = POLL_SECONDS
+            bucket["retry_after"] = now + backoff
+        bucket["polled_at"] = now
+        buckets[account] = bucket
+        cache["accounts"] = {
+            key: value
+            for key, value in buckets.items()
+            if isinstance(value, dict) and now - value.get("polled_at", 0) < SESSION_TTL
+        }
+        write_json(CACHE_PATH, cache)
     finally:
         try:
             os.unlink(LOCK_PATH)
@@ -441,14 +550,17 @@ def poll():
             pass
 
 
-def spawn_poll(cache, now):
-    """Kick off a detached refresh if the shared cache is due for one."""
+def spawn_poll(bucket, unidentified, now):
+    """Kick off a detached refresh if this session's account is due for one, or unknown."""
     if not POLL_ENABLED:
         return
-    if now < cache.get("retry_after", 0):
-        return
-    if now - cache.get("polled_at", 0) < POLL_SECONDS:
-        return
+    if not unidentified:
+        if bucket is None:
+            return  # no OAuth login to poll for
+        if now < bucket.get("retry_after", 0):
+            return
+        if now - bucket.get("polled_at", 0) < POLL_SECONDS:
+            return
     import subprocess
 
     try:
@@ -461,6 +573,48 @@ def spawn_poll(cache, now):
         )
     except OSError:
         pass
+
+
+def print_account(argv):
+    """`--account [--tmux SOCKET]`: the short name of the login this context uses, or nothing.
+
+    Meant for a tmux `#(...)` job, which tmux runs in the background and shows the last
+    output of, so the one profile request a new token needs can be made right here.
+    """
+    now = time.time()
+    login = stored_login()
+    token = login.get("accessToken")
+    if not token:
+        return
+    account = known_account(read_json(ACCOUNTS_PATH), token)
+    if account is None and live_token(login, now):
+        account = identify(token, now)
+    accounts = read_json(ACCOUNTS_PATH)
+    label = account_name(accounts, account)
+    if not label:
+        return
+    if "--tmux" in argv:
+        # Marked only once there is a name to show: otherwise neither place would show one.
+        index = argv.index("--tmux") + 1
+        socket = argv[index] if index < len(argv) else ""
+        shown = sub_dict(accounts, "tmux")
+        seen = shown.get(socket)
+        if socket and not (isinstance(seen, (int, float)) and now - seen < TMUX_SHOWN_SECONDS / 3):
+            shown[socket] = now
+            accounts["tmux"] = {
+                key: value
+                for key, value in shown.items()
+                if isinstance(value, (int, float)) and now - value < TMUX_SHOWN_SECONDS
+            }
+            write_json(ACCOUNTS_PATH, accounts)
+    sys.stdout.write(label + "\n")
+
+
+def shown_by_tmux(accounts, now):
+    """Is this pane's tmux server already showing the account in its status bar?"""
+    socket = os.environ.get("TMUX", "").split(",")[0]
+    seen = sub_dict(accounts, "tmux").get(socket) if socket else None
+    return isinstance(seen, (int, float)) and now - seen < TMUX_SHOWN_SECONDS
 
 
 # ------------------------------------------------------------------------------- git
@@ -660,6 +814,7 @@ LAYOUTS = ladder(
         "bar": BAR_CELLS,
         "countdown": WINDOWS,
         "effort": True,
+        "account": True,
         "folder": True,
         "model": True,
     },
@@ -670,6 +825,7 @@ LAYOUTS = ladder(
     {"countdown": ("five_hour",)},  # the weekly reset is days out; the 5h one is actionable
     {"countdown": ()},
     {"effort": False},
+    {"account": False},
     {"folder": False},
     {"model": False},
 )
@@ -685,6 +841,9 @@ def render(layout, info, now, columns):
         if info["effort"] and layout["effort"]:
             model_cell += f" {DIM}{info['effort']}{RESET}"
         cells.append(model_cell)
+    if info["account"] and layout["account"]:
+        # Right before the bars, since they are this account's.
+        cells.append(elide(info["account"], ACCOUNT_CELLS))
     for name in WINDOWS:  # 5-hour first, weekly second: the order is all that labels them
         cells.append(window(name, info["usage"].get(name), info["seen"][name], now, layout))
 
@@ -759,6 +918,9 @@ def main():
     if "--poll" in sys.argv:
         poll()
         return
+    if "--account" in sys.argv:
+        print_account(sys.argv)
+        return
 
     try:
         payload = json.load(sys.stdin)
@@ -766,20 +928,26 @@ def main():
         payload = {}
 
     now = time.time()
-    config = read_json(CONFIG_PATH)
-    account = current_account(config)
     stored = read_json(CACHE_PATH)
-    cache = account_cache(account)
-    utilization = config_usage(config, account)
-    rate_limits = {}
-    if own_session(cache, payload.get("session_id"), account, now):
-        rate_limits = anchored(sub_dict(payload, "rate_limits"), [utilization, cache], account, now)
-    contributions = [rate_limits, utilization]
-
-    merged = blend_into_cache(cache, contributions, now)
-    if merged != stored:
-        write_cache(merged)
-    spawn_poll(merged, now)
+    cache = load_cache()
+    accounts = read_json(ACCOUNTS_PATH)
+    limits = sub_dict(payload, "rate_limits")
+    account, trusted, unidentified = track_session(
+        cache, accounts, payload.get("session_id"), limits, now
+    )
+    if account is None:
+        # No login to attribute anything to -- an API key, or a brand-new token not yet
+        # identified -- so there is no other account's reading to confuse it with.
+        previous, bucket = {}, None
+        usage = blend_into_cache({}, [trusted], now)
+    else:
+        # `previous` still holds a window that just ran out, which is how a rollover shows.
+        previous = sub_dict(cache["accounts"], account)
+        usage = bucket = blend_into_cache(previous, [anchored(trusted, previous, now)], now)
+        cache["accounts"][account] = bucket
+    if cache != stored:
+        write_json(CACHE_PATH, cache)
+    spawn_poll(bucket, unidentified, now)
 
     cwd = sub_dict(payload, "workspace").get("current_dir") or payload.get("cwd") or os.getcwd()
     cwd = cwd.rstrip("/") if isinstance(cwd, str) else os.getcwd()
@@ -792,9 +960,10 @@ def main():
         "branch": git_branch(cwd),
         "model": model,
         "effort": effort,
-        "usage": merged,
+        "account": None if shown_by_tmux(accounts, now) else account_name(accounts, account),
+        "usage": usage,
         "seen": {
-            name: any(normalize(c.get(name)) for c in contributions + [cache]) for name in WINDOWS
+            name: any(normalize(c.get(name)) for c in (trusted, previous)) for name in WINDOWS
         },
     }
     columns = terminal_columns()
