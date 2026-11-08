@@ -1,11 +1,11 @@
 # claude-status-bar
 
 A status line for [Claude Code](https://claude.com/claude-code) that shows the working
-folder, the git branch, the model and effort level, the account the session is billing, and
+folder, the git branch, the model and effort level, how full the context is, and
 — the part that takes real work — 5-hour and weekly usage that is actually correct.
 
 ```
-we-rewrite-compact  │  rewrite-0809-integrated  │  Opus 5.5 1M xhigh  │  personal  │  ██░░░░░░  24% ·1h43m  │  ██████░░  70% →120% ·2d22h
+we-rewrite-compact  │  rewrite-0809-integrated  │  Opus 5.5 1M xhigh  │  ctx 23%  │  ██░░░░░░  24% ·1h43m  │  wk ██████░░  70% →120% ·2d22h
 ```
 
 ## Install
@@ -59,12 +59,13 @@ Claude's commit and PR attribution back.
 | branch | current git branch, `@a1b2c3d` when HEAD is detached, hidden outside a repo |
 | model | `display_name`, with `(1M context)` shortened to `1M` |
 | effort | current effort level, when set |
-| account | the login this session actually uses: `personal` for an individual plan, else the organization's name (see [Which account](#which-account)) |
-| 5-hour | first usage cell: bar, percentage, time until reset |
-| weekly | second usage cell, same |
+| context | `ctx` and the share of this session's context in use: green, yellow from 60%, red from 80% |
+| 5-hour | bar, percentage, time until reset; hidden on a plan with no five-hour window |
+| weekly | `wk`, then the same |
 
-The usage cells carry no `5h`/`wk` label: the 5-hour window is always first, and the
-countdowns read apart by unit (`1h43m` against `2d22h`).
+The 5-hour cell carries no label: it is always first, and the countdowns read apart by unit
+(`1h43m` against `2d22h`). It is hidden when the `limits` rows of `/api/oauth/usage` list no
+`session` meter and no five-hour window is running; a running window always shows.
 
 Bars are coloured by pace, not by how much is spent: the figure each window is on course to
 reach by its reset if the rest of it burns at the average rate so far. Green below 80%,
@@ -140,7 +141,7 @@ through before the poll has seen it, which matters when the usage endpoint answe
 
 ### Account in a tmux status bar
 
-With several Claude Code panes in one tmux, the account cell repeats in every pane. A tmux
+The status line does not name the account. To see it in a tmux status bar, a tmux
 `#(...)` job runs in the tmux server's context, the same as its panes, so it resolves the
 same login:
 
@@ -148,10 +149,8 @@ same login:
 set -ag status-right '#(python3 ~/.claude/statusline.py --account --tmux "#{socket_path}")'
 ```
 
-`--account` prints the short name alone. With `--tmux` it also records that this tmux server
-shows it, and the status lines in that server's panes then leave their own account cell out.
-If the bar stops reporting — the line removed, the server gone — the cell comes back within a
-minute.
+`--account` prints the short name alone: `personal` for an individual plan, else the
+organization's name.
 
 Two details that are easy to get wrong:
 
@@ -189,8 +188,8 @@ minute no matter how often the line redraws.
   tree reports "not a repository" for every worktree checkout.
 - Claude Code draws the line on one row and cuts the overflow from the end, which is where
   the weekly bar sits. So the line sheds detail in a fixed order until it fits: tighter
-  separators, then the branch, the bars from eight cells to four to none, the weekly and then
-  the 5-hour countdown, effort, account, folder and model; the percentages and the projection
+  separators, then the branch, the `wk` label, the bars from eight cells to four to none, the weekly and then
+  the 5-hour countdown, effort, folder, model and context; the percentages and the projection
   go last. The width it fits is `COLUMNS` minus 4 — the line sits in a box padded
   two columns each side, and sizing to the full terminal loses the last cells to a `…`.
 - The branch cell is sized to whatever the other cells leave, down to ten columns.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Claude Code status line: folder, git branch, model, effort, account, 5h + weekly usage.
+"""Claude Code status line: folder, git branch, model, effort, context, 5h + weekly usage.
 
 Reads the status line JSON payload on stdin (schema: `claude` 2.1.x), prints one line.
 
@@ -84,9 +84,8 @@ Credentials are read, never written. Refreshing the OAuth token is Claude Code's
 401 this backs off and keeps rendering from cache.
 
 `--account` prints the account's short name alone, for a tmux status bar: `#(...)` jobs run
-in the tmux server's context, the same as its panes, so they resolve the same login. Given
-`--tmux '#{socket_path}'` it also records that this server shows it, and status lines in
-that server's panes leave their own account cell out rather than repeat it in every pane.
+in the tmux server's context, the same as its panes, so they resolve the same login. The
+status line itself does not show it.
 """
 
 import json
@@ -138,11 +137,12 @@ IDENTITY_SECONDS = 10.0
 MAX_TOKENS = 32
 # A tmux bar that stopped reporting (old config, server gone) hands the cell back this soon.
 TMUX_SHOWN_SECONDS = 60.0
-ACCOUNT_CELLS = 16
 WINDOWS = ("five_hour", "seven_day")
 WINDOW_SECONDS = {"five_hour": 5 * 3600, "seven_day": 7 * 86400}
 PACE_FLOOR = 0.15
 PACE_WARN = 80
+CONTEXT_WARN = 60
+CONTEXT_FULL = 80
 # The 5h bar's colour already carries its pace, and its countdown is short enough to read
 # directly; a projected figure beside it was noise. The weekly one is days out, so it stays.
 PROJECTED = ("seven_day",)
@@ -561,6 +561,24 @@ def polled(response, now):
     return readings
 
 
+def has_session_limit(response):
+    """Does the account's plan meter a five-hour window? True, False, or None for unknown.
+
+    `five_hour: null` cannot say: it is also what a plan with the window reports while none
+    is running. The `limits` rows can, since they list the meters the plan has, and Claude
+    Code's schema says to classify them on `kind`. A plan's idle five-hour row may still be
+    left out, so `main` lets any running window override a False here.
+    """
+    if not isinstance(response, dict):
+        return None
+    if normalize(response.get("five_hour")) is not None:
+        return True
+    rows = response.get("limits")
+    if not isinstance(rows, list) or not rows:
+        return None
+    return any(isinstance(row, dict) and "session" in (row.get("kind"), row.get("group")) for row in rows)
+
+
 def poll():
     """Refresh this context's account in the shared cache. Runs detached; output ignored."""
     import urllib.error
@@ -617,6 +635,9 @@ def poll():
         if fresh is not None:
             bucket = blend_into_cache(bucket, [polled(fresh, now)], now)
             bucket.pop("retry_after", None)
+            metered = has_session_limit(fresh)
+            if metered is not None:
+                bucket["session_limit"] = metered
         else:
             if not any(name in bucket for name in WINDOWS):
                 # Nothing to serve in the meantime -- an account's first poll. A long backoff
@@ -696,13 +717,6 @@ def print_account(argv):
             }
             write_json(ACCOUNTS_PATH, accounts)
     sys.stdout.write(label + "\n")
-
-
-def shown_by_tmux(accounts, now):
-    """Is this pane's tmux server already showing the account in its status bar?"""
-    socket = os.environ.get("TMUX", "").split(",")[0]
-    seen = sub_dict(accounts, "tmux").get(socket) if socket else None
-    return isinstance(seen, (int, float)) and now - seen < TMUX_SHOWN_SECONDS
 
 
 # ------------------------------------------------------------------------------- git
@@ -857,6 +871,14 @@ def window(name, data, was_seen, now, layout):
     return cell
 
 
+def context_cell(pct):
+    """How full this session's context is, labelled because the usage bars are not."""
+    if pct is None:
+        return f"{DIM}ctx --{RESET}"
+    color = RED if pct >= CONTEXT_FULL else YELLOW if pct >= CONTEXT_WARN else GREEN
+    return f"{DIM}ctx{RESET} {color}{pct:.0f}%{RESET}"
+
+
 def short_model(name):
     # "Opus 5 (1M context)" is too wide for a status line; keep the capacity hint.
     return name.replace(" (1M context)", " 1M").replace("Claude ", "")
@@ -902,20 +924,22 @@ LAYOUTS = ladder(
         "bar": BAR_CELLS,
         "countdown": WINDOWS,
         "effort": True,
-        "account": True,
         "folder": True,
         "model": True,
+        "context": True,
+        "label": True,
     },
     {"sep": SEP_NARROW},  # whitespace goes before anything that carries information
     {"branch": False},
+    {"label": False},
     {"bar": BAR_CELLS // 2},
     {"bar": 0},
     {"countdown": ("five_hour",)},  # the weekly reset is days out; the 5h one is actionable
     {"countdown": ()},
     {"effort": False},
-    {"account": False},
     {"folder": False},
     {"model": False},
+    {"context": False},
 )
 
 
@@ -929,11 +953,11 @@ def render(layout, info, now, columns):
         if info["effort"] and layout["effort"]:
             model_cell += f" {DIM}{info['effort']}{RESET}"
         cells.append(model_cell)
-    if info["account"] and layout["account"]:
-        # Right before the bars, since they are this account's.
-        cells.append(elide(info["account"], ACCOUNT_CELLS))
-    for name in WINDOWS:  # 5-hour first, weekly second: the order is all that labels them
-        cells.append(window(name, info["usage"].get(name), info["seen"][name], now, layout))
+    if layout["context"]:
+        cells.append(context_cell(info["context"]))
+    for name in info["windows"]:  # 5-hour first, weekly second: the order and units label them
+        cell = window(name, info["usage"].get(name), info["seen"][name], now, layout)
+        cells.append(f"{DIM}wk{RESET} {cell}" if name == "seven_day" and layout["label"] else cell)
 
     sep = layout["sep"]
     room = columns - printed_width(sep.join(cells))
@@ -1043,13 +1067,23 @@ def main():
     model = sub_dict(payload, "model").get("display_name")
     model = model if isinstance(model, str) and model else "?"
     effort = sub_dict(payload, "effort").get("level")
+    context = sub_dict(payload, "context_window").get("used_percentage")
+    context = context if isinstance(context, (int, float)) and not isinstance(context, bool) else None
+    # A running window always shows, whatever the last poll concluded about the plan.
+    no_session_limit = bucket is not None and bucket.get("session_limit") is False
+    shown = [
+        name
+        for name in WINDOWS
+        if not (name == "five_hour" and no_session_limit and "resets_at" not in usage.get(name, {}))
+    ]
 
     info = {
         "folder": os.path.basename(cwd),
         "branch": git_branch(cwd),
         "model": model,
         "effort": effort,
-        "account": None if shown_by_tmux(accounts, now) else account_name(accounts, account),
+        "context": context,
+        "windows": shown,
         # An idle window shows the same as one that just ran out: nothing spent since.
         "usage": {name: usage[name] for name in WINDOWS if "resets_at" in usage.get(name, {})},
         "seen": {
