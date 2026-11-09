@@ -192,12 +192,25 @@ class MagpieStatusTests(unittest.TestCase):
         medium = status.ANSI.sub('', status.render_status(info, self.NOW, 64))
         narrow = status.ANSI.sub('', status.render_status(info, self.NOW, 38))
         for text in [medium, narrow]:
-            self.assertNotIn('long-project-name', text)
             self.assertNotIn('long-feature-branch', text)
             self.assertNotIn('1M', text)
             self.assertNotIn('·', text)
+        self.assertIn('long-project-name', medium)
+        self.assertNotIn('long-project-name', narrow)
         self.assertNotIn('low', narrow)
         self.assertNotIn(' l ', narrow)
+
+    def test_folder_and_branch_show_whenever_they_fit(self):
+        # A 113-column tmux pane leaves 109 for the line, one short of the old wide gate.
+        self.write_records(self.record())
+        self.write_quotas()
+        info = dict(self.snapshot(), folder='reel', branch='reel-gpt-rev', context=23)
+        for columns in [90, 109]:
+            line = status.render_status(info, self.NOW, columns)
+            text = status.ANSI.sub('', line)
+            self.assertLessEqual(status.printed_width(line), columns)
+            self.assertIn('reel │ reel-gpt-rev', text)
+            self.assertRegex(text, r'wk\s*4% ·1d0h')
 
     def test_medium_panes_show_both_reset_countdowns(self):
         self.write_records(self.record())

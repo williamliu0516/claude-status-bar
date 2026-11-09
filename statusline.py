@@ -1066,8 +1066,10 @@ def layouts_for(columns):
     wide = columns >= 110
     countdowns = WINDOWS if columns >= 80 else ()
     return ladder(
+        # Folder and branch are not gated on width: they show whenever they fit, and are
+        # the first detail shed when they do not.
         {"sep": SEP_NARROW if columns >= 50 else "  ",
-         "branch": wide, "folder": wide,
+         "branch": True, "folder": True,
          "countdown": countdowns,
          "effort": columns >= 60, "full_account": wide,
          "model_mode": 0 if wide else 1,

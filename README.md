@@ -2,7 +2,7 @@
 
 A status line for [Claude Code](https://claude.com/claude-code) that adapts to each pane's
 width. It keeps the actual model and account, context usage, and labeled 5-hour and weekly
-percentages visible. Wide panes add the folder, branch, effort and reset times.
+percentages visible. Folder and branch show whenever they fit; wider panes add effort and reset times.
 
 ```
 WE Opus5.5  ctx23%  5h24%  wk70%
@@ -193,8 +193,9 @@ minute no matter how often the line redraws.
   runs 60 times a minute. Linked worktrees and submodules keep a `.git` **file** holding a
   `gitdir:` pointer instead of a directory, which the resolver follows — a naive walk up the
   tree reports "not a repository" for every worktree checkout.
-- Claude Code draws the line on one row. At 110 usable columns it can show full account
-  names, folder and branch; below that, accounts become `WE` (WorldEngine), `P` (Personal)
+- Claude Code draws the line on one row. Folder and branch show whenever they fit and are
+  the first detail shed when they do not. At 110 usable columns it shows full account
+  names; below that, accounts become `WE` (WorldEngine), `P` (Personal)
   or `CX` (Codex), and model names tighten. Reset times need at least 80 columns and effort
   needs 60. Narrower panes keep the model, account, context, `5h` and `wk` percentages,
   compacting further to forms like `O5.5` and `c23%` when necessary. Available width is
