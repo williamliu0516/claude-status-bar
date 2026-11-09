@@ -208,6 +208,21 @@ class MagpieStatusTests(unittest.TestCase):
             self.assertLessEqual(status.printed_width(line), columns)
             self.assertRegex(status.ANSI.sub('', line), r'wk\s*4%')
 
+    def test_original_colors_remain_visible_with_numeric_adaptive_layouts(self):
+        self.write_records(self.record())
+        self.write_quotas()
+        info = dict(self.snapshot(), folder='project', branch='feature-branch', context=23)
+        for columns in [38, 125]:
+            line = status.render_status(info, self.NOW, columns)
+            self.assertIn(status.CYAN, line)
+            self.assertIn(status.BLUE, line)
+            self.assertIn(status.GREEN + '23%', line)
+            self.assertIn(status.GREEN + '12%', line)
+            self.assertLessEqual(status.printed_width(line), columns)
+        wide = status.render_status(info, self.NOW, 125)
+        self.assertIn(status.MAGENTA + 'feature-branch', wide)
+        self.assertIn(status.CYAN + status.BOLD + 'project', wide)
+
 
 if __name__ == '__main__':
     unittest.main()

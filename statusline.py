@@ -952,7 +952,7 @@ def usage_color(pct, pace):
         return RED
     if pace >= PACE_WARN:
         return YELLOW
-    return ""
+    return GREEN
 
 
 def countdown(resets_at, now):
@@ -993,7 +993,7 @@ def context_cell(pct, compact=False):
     label = "c" if compact else "ctx"
     if pct is None:
         return f"{DIM}{label}--{RESET}"
-    color = RED if pct >= CONTEXT_FULL else YELLOW if pct >= CONTEXT_WARN else ""
+    color = RED if pct >= CONTEXT_FULL else YELLOW if pct >= CONTEXT_WARN else GREEN
     return f"{DIM}{label}{RESET}{color}{pct:.0f}%{RESET}"
 
 
@@ -1087,8 +1087,8 @@ def render(layout, info, now, columns):
     """The status line under `layout`, and whether it fits in `columns`."""
     cells = []
     if layout["folder"]:
-        cells.append(f"{DIM}{info['folder']}{RESET}")
-    model_cell = model_label(info["model"], layout["model_mode"])
+        cells.append(f"{CYAN}{BOLD}{info['folder']}{RESET}")
+    model_cell = f"{BLUE}{model_label(info['model'], layout['model_mode'])}{RESET}"
     account = account_label(info.get("account"), layout["full_account"])
     if account:
         model_cell = f"{CYAN}{account}{RESET} " + model_cell
@@ -1113,7 +1113,7 @@ def render(layout, info, now, columns):
         branch = elide(info["branch"], room)
         while printed_width(branch) > room and len(branch) > 1:
             branch = elide(branch, len(branch) - 1)
-        cells.insert(1, f"{DIM}{branch}{RESET}")
+        cells.insert(1, f"{MAGENTA}{branch}{RESET}")
     return sep.join(cells), room >= 0
 
 

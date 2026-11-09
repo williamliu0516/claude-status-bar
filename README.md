@@ -60,7 +60,7 @@ Claude's commit and PR attribution back.
 | model | `display_name`, with `(1M context)` shortened to `1M`; Magpie sessions show the model actually served |
 | account | the account used by this session, beside the model |
 | effort | current effort level, when set and space allows |
-| context | `ctx` and the share of this session's context in use: neutral, yellow from 60%, red from 80% |
+| context | `ctx` and the share of this session's context in use: green, yellow from 60%, red from 80% |
 | 5-hour | `5h` and the percentage; reset time on wide panes; absent on a plan with no five-hour window |
 | weekly | `wk` and the percentage; reset time and a hot pace projection when space allows |
 
@@ -69,7 +69,7 @@ progress bars. A five-hour window is absent when the plan has none; a running on
 shows.
 
 Quota warnings use pace as well as the share spent: the figure each window is on course to
-reach by its reset if the rest burns at the average rate so far. Normal usage stays neutral,
+reach by its reset if the rest burns at the average rate so far. Normal usage stays green,
 yellow from 80% projected, red from 100%, and bold red once
 90% is actually used, whatever the pace. On wide panes the hot weekly projection can appear
 beside the figure, `70% →120%`. So 60% with half a
