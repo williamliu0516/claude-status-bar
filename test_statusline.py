@@ -199,6 +199,21 @@ class MagpieStatusTests(unittest.TestCase):
         self.assertNotIn('low', narrow)
         self.assertNotIn(' l ', narrow)
 
+    def test_medium_panes_show_both_reset_countdowns(self):
+        self.write_records(self.record())
+        self.write_quotas()
+        info = dict(self.snapshot(), folder='project', branch='feature', context=23)
+        for columns in [80, 96, 125]:
+            text = status.ANSI.sub('', status.render_status(info, self.NOW, columns))
+            self.assertRegex(text, r'5h\s*12% ·1h00m')
+            self.assertRegex(text, r'wk\s*4% ·1d0h')
+
+    def test_weekly_countdown_goes_before_the_five_hour_one(self):
+        layouts = status.layouts_for(90)
+        steps = [layout['countdown'] for layout in layouts]
+        self.assertEqual(steps[0], status.WINDOWS)
+        self.assertLess(steps.index(('five_hour',)), steps.index(()))
+
     def test_unicode_metadata_respects_terminal_cell_width(self):
         self.write_records(self.record())
         self.write_quotas()

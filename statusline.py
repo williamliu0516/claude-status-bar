@@ -1064,16 +1064,19 @@ def layouts_for(columns):
     changes remove metadata and abbreviate labels; they never remove a quota or its unit.
     """
     wide = columns >= 110
+    countdowns = WINDOWS if columns >= 80 else ()
     return ladder(
         {"sep": SEP_NARROW if columns >= 50 else "  ",
          "branch": wide, "folder": wide,
-         "countdown": WINDOWS if wide else ("five_hour",) if columns >= 80 else (),
+         "countdown": countdowns,
          "effort": columns >= 60, "full_account": wide,
          "model_mode": 0 if wide else 1,
          "context_compact": False, "compact": columns < 60,
          "projection": wide},
         {"branch": False},
         {"folder": False},
+        # The weekly countdown changes once an hour; the five-hour one is the more urgent.
+        {"countdown": tuple(name for name in countdowns if name == "five_hour")},
         {"countdown": ()},
         {"projection": False},
         {"effort": False},

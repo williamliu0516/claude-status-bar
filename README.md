@@ -61,8 +61,8 @@ Claude's commit and PR attribution back.
 | account | the account used by this session, beside the model |
 | effort | current effort level, when set and space allows |
 | context | `ctx` and the share of this session's context in use: green, yellow from 60%, red from 80% |
-| 5-hour | `5h` and the percentage; reset time on wide panes; absent on a plan with no five-hour window |
-| weekly | `wk` and the percentage; reset time and a hot pace projection when space allows |
+| 5-hour | `5h` and the percentage; reset time from 80 columns; absent on a plan with no five-hour window |
+| weekly | `wk` and the percentage; reset time from 80 columns (dropped before the 5-hour one when space runs short) and a hot pace projection on wide panes |
 
 Both percentages are always labeled, including on narrow panes. Quotas use numbers, never
 progress bars. A five-hour window is absent when the plan has none; a running one always
