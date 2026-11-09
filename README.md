@@ -1,11 +1,11 @@
 # claude-status-bar
 
-A status line for [Claude Code](https://claude.com/claude-code) that shows the working
-folder, the git branch, the model and effort level, how full the context is, and
-— the part that takes real work — 5-hour and weekly usage that is actually correct.
+A status line for [Claude Code](https://claude.com/claude-code) that adapts to each pane's
+width. It keeps the actual model and account, context usage, and labeled 5-hour and weekly
+percentages visible. Wide panes add the folder, branch, effort and reset times.
 
 ```
-we-rewrite-compact  │  rewrite-0809-integrated  │  Opus 5.5 1M xhigh  │  ctx 23%  │  ██░░░░░░  24% ·1h43m  │  wk ██████░░  70% →120% ·2d22h
+WE Opus5.5  ctx23%  5h24%  wk70%
 ```
 
 ## Install
@@ -57,21 +57,22 @@ Claude's commit and PR attribution back.
 | --- | --- |
 | folder | basename of the session's working directory |
 | branch | current git branch, `@a1b2c3d` when HEAD is detached, hidden outside a repo |
-| model | `display_name`, with `(1M context)` shortened to `1M` |
-| effort | current effort level, when set |
-| context | `ctx` and the share of this session's context in use: green, yellow from 60%, red from 80% |
-| 5-hour | bar, percentage, time until reset; hidden on a plan with no five-hour window |
-| weekly | `wk`, then the same |
+| model | `display_name`, with `(1M context)` shortened to `1M`; Magpie sessions show the model actually served |
+| account | the account used by this session, beside the model |
+| effort | current effort level, when set and space allows |
+| context | `ctx` and the share of this session's context in use: neutral, yellow from 60%, red from 80% |
+| 5-hour | `5h` and the percentage; reset time on wide panes; absent on a plan with no five-hour window |
+| weekly | `wk` and the percentage; reset time and a hot pace projection when space allows |
 
-The 5-hour cell carries no label: it is always first, and the countdowns read apart by unit
-(`1h43m` against `2d22h`). It is hidden when the `limits` rows of `/api/oauth/usage` list no
-`session` meter and no five-hour window is running; a running window always shows.
+Both percentages are always labeled, including on narrow panes. Quotas use numbers, never
+progress bars. A five-hour window is absent when the plan has none; a running one always
+shows.
 
-Bars are coloured by pace, not by how much is spent: the figure each window is on course to
-reach by its reset if the rest of it burns at the average rate so far. Green below 80%,
-yellow from 80%, red from 100% — on course to run out before the reset — and bold red once
-90% is actually used, whatever the pace. From 80% the weekly projection is printed beside
-the figure, `70% →120%`; the 5-hour bar shows its pace by colour only. So 60% with half a
+Quota warnings use pace as well as the share spent: the figure each window is on course to
+reach by its reset if the rest burns at the average rate so far. Normal usage stays neutral,
+yellow from 80% projected, red from 100%, and bold red once
+90% is actually used, whatever the pace. On wide panes the hot weekly projection can appear
+beside the figure, `70% →120%`. So 60% with half a
 day left stays green, where 60% on the first day of
 the week does not. Elapsed time is floored at 15% of the window (about 45 minutes, or a
 day), so one large prompt at the start of a window does not read as a runaway.
@@ -139,18 +140,24 @@ stays put for an account's whole week, so it tells two accounts apart where five
 boundaries cannot (two can close on the same minute), and it lets a new five-hour window
 through before the poll has seen it, which matters when the usage endpoint answers 429.
 
-### Account in a tmux status bar
+### Magpie routing and account display
 
-The status line does not name the account. To see it in a tmux status bar, a tmux
-`#(...)` job runs in the tmux server's context, the same as its panes, so it resolves the
-same login:
+Each Claude session shows its own account beside the model. When its endpoint is the local
+Magpie gateway, the latest completed request in `~/.config/magpie/usage.jsonl` supplies the
+actual model, effort and account. A GPT fallback therefore shows GPT and Codex even while
+Claude's configured model is Opus. Before a session's first request, it shows `Magpie…`.
+The usage bars read Magpie's `quotas.json` for that exact provider and account, including the
+organization suffix when one email has multiple seats. No native OAuth polling runs for
+these sessions. `XDG_CONFIG_HOME` is respected.
 
-```tmux
-set -ag status-right '#(python3 ~/.claude/statusline.py --account --tmux "#{socket_path}")'
-```
+Only the ledger's latest 1 MiB is scanned, and a small per-session cache in
+`~/.claude/statusline-magpie/` keeps an idle session's last account when newer requests push
+it out of that tail. This reads local metadata only; it makes no network requests and
+does not read or copy Magpie's tokens. Account and model update after a request completes.
 
-`--account` prints the short name alone: `personal` for an individual plan, else the
-organization's name.
+`--account` remains available for older integrations and prints the native login's short
+name. A single tmux-wide native-login label cannot describe Magpie's per-session routing;
+the account now belongs in each Claude session's own line.
 
 Two details that are easy to get wrong:
 
@@ -186,12 +193,12 @@ minute no matter how often the line redraws.
   runs 60 times a minute. Linked worktrees and submodules keep a `.git` **file** holding a
   `gitdir:` pointer instead of a directory, which the resolver follows — a naive walk up the
   tree reports "not a repository" for every worktree checkout.
-- Claude Code draws the line on one row and cuts the overflow from the end, which is where
-  the weekly bar sits. So the line sheds detail in a fixed order until it fits: tighter
-  separators, then the branch, the `wk` label, the bars from eight cells to four to none, the weekly and then
-  the 5-hour countdown, effort, folder, model and context; the percentages and the projection
-  go last. The width it fits is `COLUMNS` minus 4 — the line sits in a box padded
-  two columns each side, and sizing to the full terminal loses the last cells to a `…`.
+- Claude Code draws the line on one row. At 110 usable columns it can show full account
+  names, folder and branch; below that, accounts become `WE` (WorldEngine), `P` (Personal)
+  or `CX` (Codex), and model names tighten. Reset times need at least 80 columns and effort
+  needs 60. Narrower panes keep the model, account, context, `5h` and `wk` percentages,
+  compacting further to forms like `O5.5` and `c23%` when necessary. Available width is
+  `COLUMNS` minus 4 for Claude's padding. Unicode display width is respected.
 - The branch cell is sized to whatever the other cells leave, down to ten columns.
   Long names are elided from the middle: `rewrite-0809-integrated` and
   `rewrite-0809-integrated-compact` differ only in the suffix, so trimming the tail would

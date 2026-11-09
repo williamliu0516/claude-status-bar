@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Claude Code status line: folder, git branch, model, effort, context, 5h + weekly usage.
+"""Claude Code status line: folder, branch, actual model/account, context and usage.
 
 Reads the status line JSON payload on stdin (schema: `claude` 2.1.x), prints one line.
 
-    we-rewrite-compact │ rewrite-0809-integrated │ Opus 5.5 1M xhigh │ ██░░ 24% ·1h43m │ …
+    WE Opus5.5  ctx23%  5h24%  wk70%
 
-Usage is colored by pace -- the figure each window is on course to reach by its reset --
-rather than by how much is spent so far, and the weekly projection is printed
-(`62% →104%`) once it runs hot. On a narrow terminal the line sheds detail in a fixed order (see `LAYOUTS`)
-instead of letting Claude Code cut the weekly bar off the end.
+Usage is numeric, with warnings colored by pace and the share spent. Wide panes can show
+the weekly projection (`62% →104%`) and reset times. Narrow panes abbreviate the account
+and model while keeping context and both available quota percentages visible.
 
 Install with `python3 statusline.py --install`.
 
@@ -83,9 +82,13 @@ ever needs it.
 Credentials are read, never written. Refreshing the OAuth token is Claude Code's job; on
 401 this backs off and keeps rendering from cache.
 
-`--account` prints the account's short name alone, for a tmux status bar: `#(...)` jobs run
-in the tmux server's context, the same as its panes, so they resolve the same login. The
-status line itself does not show it.
+When the session uses Magpie, its latest completed request in the local usage ledger
+identifies the actual model and account. Quotas come from Magpie's cache for that exact
+account, not the CLI's native login or another session's latest request. No OAuth lookup
+or network poll runs on this path. Before the first request the account reads Magpie….
+
+`--account` still prints the native login's short name for older tmux integrations. It
+cannot identify a gateway's routed account; the main line shows that per session instead.
 """
 
 import json
@@ -95,9 +98,6 @@ import sys
 import time
 from datetime import datetime, timezone
 
-BAR_CELLS = 8
-BAR_FULL = "█"
-BAR_EMPTY = "░"
 BRANCH_CELLS = 32
 BRANCH_FLOOR = 10
 STATUS_INSET = 4
@@ -110,6 +110,9 @@ CREDENTIALS_PATH = os.path.expanduser("~/.claude/.credentials.json")
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 SETTINGS_PATH = os.path.expanduser("~/.claude/settings.json")
 INSTALL_PATH = os.path.expanduser("~/.claude/statusline.py")
+MAGPIE_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "magpie")
+MAGPIE_CACHE_DIR = os.path.expanduser("~/.claude/statusline-magpie")
+MAGPIE_LOG_BYTES = 1024 * 1024
 # The object form: newer Claude Code also takes `"attribution": false`, but older versions
 # reject a boolean there. `includeCoAuthoredBy` is the deprecated key those older versions read.
 NO_ATTRIBUTION = {"commit": "", "pr": "", "sessionUrl": False}
@@ -143,8 +146,7 @@ PACE_FLOOR = 0.15
 PACE_WARN = 80
 CONTEXT_WARN = 60
 CONTEXT_FULL = 80
-# The 5h bar's colour already carries its pace, and its countdown is short enough to read
-# directly; a projected figure beside it was noise. The weekly one is days out, so it stays.
+# A weekly projection is useful on wide panes; short five-hour windows need only a timer.
 PROJECTED = ("seven_day",)
 
 RESET = "\033[0m"
@@ -312,6 +314,140 @@ def account_label(profile):
 def account_name(accounts, account):
     label = sub_dict(sub_dict(accounts, "accounts"), account).get("label") if account else None
     return label if isinstance(label, str) and label else None
+
+
+# --------------------------------------------------------------------------- Magpie
+
+
+def magpie_configured():
+    """Use the session's endpoint first, including an explicit non-Magpie override."""
+    base = os.environ.get("ANTHROPIC_BASE_URL")
+    if base is None:
+        base = sub_dict(read_json(SETTINGS_PATH), "env").get("ANTHROPIC_BASE_URL", "")
+    return isinstance(base, str) and bool(re.match(
+        r"^https?://(?:127\.0\.0\.1|localhost|\[::1\]):3425(?:/|$)", base
+    ))
+
+
+def magpie_record(session_id):
+    """Last routed request for this CLI session, never a machine-wide last account.
+
+    Scan only the ledger's tail and keep a small per-session result. An idle session's
+    account survives a busy ledger or log rotation; unrelated sessions cannot replace it.
+    Partial trailing records are ignored and retried on the next render.
+    """
+    if not isinstance(session_id, str) or not session_id:
+        return {}
+    import hashlib
+
+    cache_path = os.path.join(MAGPIE_CACHE_DIR, hashlib.sha256(session_id.encode()).hexdigest() + ".json")
+    cached = read_json(cache_path)
+    record = sub_dict(cached, "record")
+    try:
+        with open(os.path.join(MAGPIE_DIR, "usage.jsonl"), "rb") as handle:
+            stat = os.fstat(handle.fileno())
+            signature = [stat.st_ino, stat.st_size, stat.st_mtime_ns]
+            if cached.get("signature") == signature:
+                return record
+            start = max(0, stat.st_size - MAGPIE_LOG_BYTES)
+            handle.seek(start)
+            if start:
+                handle.readline()  # the scan may begin partway through a record
+            tail = handle.read(MAGPIE_LOG_BYTES).decode("utf-8", errors="replace")
+    except OSError:
+        return record
+    for line in reversed(tail.splitlines()):
+        try:
+            candidate = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(candidate, dict):
+            continue
+        actual_session = candidate.get("native_session") or candidate.get("session")
+        if actual_session != session_id or not candidate.get("providerAccount"):
+            continue
+        record = {key: candidate[key] for key in (
+            "provider", "providerAccount", "model", "served", "effort"
+        ) if key in candidate}
+        break
+    try:
+        os.makedirs(MAGPIE_CACHE_DIR, mode=0o700, exist_ok=True)
+        write_json(cache_path, {"signature": signature, "record": record})
+    except OSError:
+        pass
+    return record
+
+
+def magpie_account_label(provider, user, accounts):
+    if provider == "codex":
+        return "Codex"
+    if " · " in user:
+        return user.rsplit(" · ", 1)[1]
+    for person in sub_dict(accounts, "accounts").values():
+        email = person.get("email") if isinstance(person, dict) else None
+        if isinstance(email, str) and email.lower() == user.lower():
+            label = person.get("label")
+            if isinstance(label, str) and label:
+                return "Personal" if label.lower() == "personal" else label
+    return user.split("@", 1)[0] or provider
+
+
+def magpie_model_name(served, payload_model):
+    requested = payload_model.get("id")
+    requested = requested.rsplit("/", 1)[-1].replace("[1m]", "") if isinstance(requested, str) else ""
+    display = payload_model.get("display_name")
+    if requested == served and isinstance(display, str) and display:
+        return display
+    match = re.match(r"^claude-(opus|sonnet|haiku|fable)-(\d+)(?:[.-](\d{1,2}))?(?:-|$)", served)
+    if match:
+        version = match[2] + ("." + match[3] if match[3] else "")
+        return match[1].capitalize() + " " + version
+    if served.startswith("gpt-"):
+        return "GPT-" + "-".join(piece.capitalize() for piece in served[4:].split("-"))
+    return served
+
+
+def magpie_state(payload, accounts, now):
+    """A routed account and its own cached windows, or None for native Claude use."""
+    if not magpie_configured():
+        return None
+    record = magpie_record(payload.get("session_id"))
+    state = {"account": "Magpie…", "model": None, "effort": None,
+             "windows": [], "usage": {}, "seen": {}}
+    if not record:
+        return state
+    provider, user = record.get("provider", ""), record.get("providerAccount", "")
+    if not isinstance(provider, str) or not isinstance(user, str):
+        return state
+    state["account"] = magpie_account_label(provider, user, accounts)
+    served = record.get("served") or record.get("model")
+    if isinstance(served, str) and served:
+        state["model"] = magpie_model_name(served.rsplit("/", 1)[-1], sub_dict(payload, "model"))
+    state["effort"] = record.get("effort")
+    # Exact match, case-insensitive: two seats of the same email can have distinct quotas.
+    wanted = (provider + "/" + user).lower()
+    quota = {}
+    for key, entry in read_json(os.path.join(MAGPIE_DIR, "quotas.json")).items():
+        if key.lower() == wanted and isinstance(entry, dict):
+            quota = sub_dict(entry, "quota")
+            break
+    names = {"5 hours": "five_hour", "5h": "five_hour", "7 days": "seven_day", "7d": "seven_day"}
+    windows = quota.get("windows", [])
+    for item in windows if isinstance(windows, list) else []:
+        if not isinstance(item, dict):
+            continue
+        name = names.get(str(item.get("name", "")).lower())
+        if not name:
+            continue  # a model-specific weekly pool has a different denominator
+        value = item.get("used")
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            continue
+        state["seen"][name] = True
+        found = normalize({"used_percentage": value, "resets_at": item.get("resetsAt")})
+        if found and plausible(found, now):
+            state["usage"][name] = found
+    state["windows"] = [name for name in WINDOWS if name in state["seen"]]
+    return state
 
 
 def observe(seen, limits, now, switched):
@@ -816,12 +952,7 @@ def usage_color(pct, pace):
         return RED
     if pace >= PACE_WARN:
         return YELLOW
-    return GREEN
-
-
-def bar(pct, cells):
-    filled = min(cells, max(0, round(pct / 100 * cells)))
-    return BAR_FULL * filled + BAR_EMPTY * (cells - filled)
+    return ""
 
 
 def countdown(resets_at, now):
@@ -840,43 +971,30 @@ def countdown(resets_at, now):
 
 
 def window(name, data, was_seen, now, layout):
-    """One rate-limit window: `████░░░░  47% ·2h13m`, or `… 62% →104% ·2d4h` when hot.
-
-    Unlabelled: the 5-hour window is always the first of the two and the weekly one the
-    second, and their countdowns read apart by unit (`2h13m` against `2d4h`). A `5h`/`wk`
-    label cost six columns across the pair for something the position already says.
-
-    The projection (weekly only, see PROJECTED) survives every layout step: on a narrow
-    terminal it is the one figure that says whether to slow down, so a countdown or the
-    bar goes first.
-    """
-    cells = layout["bar"]
+    """A labeled percentage; reset times and pace are optional wide-pane detail."""
+    label = "5h" if name == "five_hour" else "wk"
+    gap = "" if layout["compact"] else " "
+    prefix = f"{DIM}{label}{RESET}{gap}"
     if data is None:
-        if was_seen:
-            # The window rolled over, so its old figure is gone and usage restarted at ~0.
-            empty = f"{GREEN}{BAR_EMPTY * cells}{RESET} " if cells else ""
-            return f"{empty}{DIM}~0%{RESET}"
-        empty = f"{BAR_EMPTY * cells} " if cells else ""
-        return f"{DIM}{empty}--{RESET}"
+        return prefix + f"{DIM}{'~0%' if was_seen else '--'}{RESET}"
     pct = data["used_percentage"]
     pace = projected(data, WINDOW_SECONDS[name], now)
     color = usage_color(pct, pace)
-    # Padded to three digits beside a bar so the bar does not jump as the figure grows.
-    figure = f"{bar(pct, cells)} {pct:3.0f}%" if cells else f"{pct:.0f}%"
-    cell = f"{color}{figure}{RESET}"
-    if name in PROJECTED and pace >= PACE_WARN and round(pace) > round(pct):
+    cell = prefix + f"{color}{pct:.0f}%{RESET}"
+    if layout["projection"] and name in PROJECTED and pace >= PACE_WARN and round(pace) > round(pct):
         cell += f" {color}→{min(pace, 999):.0f}%{RESET}"
     if name in layout["countdown"]:
         cell += f" {DIM}·{countdown(data['resets_at'], now)}{RESET}"
     return cell
 
 
-def context_cell(pct):
+def context_cell(pct, compact=False):
     """How full this session's context is, labelled because the usage bars are not."""
+    label = "c" if compact else "ctx"
     if pct is None:
-        return f"{DIM}ctx --{RESET}"
-    color = RED if pct >= CONTEXT_FULL else YELLOW if pct >= CONTEXT_WARN else GREEN
-    return f"{DIM}ctx{RESET} {color}{pct:.0f}%{RESET}"
+        return f"{DIM}{label}--{RESET}"
+    color = RED if pct >= CONTEXT_FULL else YELLOW if pct >= CONTEXT_WARN else ""
+    return f"{DIM}{label}{RESET}{color}{pct:.0f}%{RESET}"
 
 
 def short_model(name):
@@ -884,9 +1002,35 @@ def short_model(name):
     return name.replace(" (1M context)", " 1M").replace("Claude ", "")
 
 
+def model_label(name, mode):
+    label = short_model(name)
+    if mode == 0:
+        return label
+    label = label.replace(" 1M", "").replace(" ", "").replace("GPT-", "GPT")
+    if mode >= 2:
+        label = re.sub(r"^(Opus|Sonnet|Haiku|Fable)", lambda match: match[1][0], label)
+        label = re.sub(r"^GPT([\d.]+)-(Sol|Terra|Astra|Luna)$",
+                       lambda match: "G" + match[1] + match[2][0], label)
+    return label
+
+
+def account_label(name, full):
+    if not name or full:
+        return name
+    return {"worldengine": "WE", "personal": "P", "codex": "CX", "magpie…": "MP…"}.get(
+        name.lower(), elide(name, 8)
+    )
+
+
 def printed_width(text):
     """Columns actually occupied, discounting the SGR escapes woven through every cell."""
-    return len(ANSI.sub("", text))
+    text = ANSI.sub("", text)
+    if text.isascii():
+        return len(text)
+    import unicodedata
+
+    return sum(0 if unicodedata.combining(char) else
+               2 if unicodedata.east_asian_width(char) in ("W", "F") else 1 for char in text)
 
 
 def terminal_columns():
@@ -913,51 +1057,50 @@ def ladder(first, *steps):
     return tuple(layouts)
 
 
-# Most detailed first; each step gives up the least useful thing still on the line. Claude
-# Code renders the status line on one row and cuts the overflow from the end -- which is
-# where the weekly bar sits -- so the trimming has to happen here, and the usage figures,
-# the reason this script exists, are the last thing standing.
-LAYOUTS = ladder(
-    {
-        "sep": SEP,
-        "branch": True,
-        "bar": BAR_CELLS,
-        "countdown": WINDOWS,
-        "effort": True,
-        "folder": True,
-        "model": True,
-        "context": True,
-        "label": True,
-    },
-    {"sep": SEP_NARROW},  # whitespace goes before anything that carries information
-    {"branch": False},
-    {"label": False},
-    {"bar": BAR_CELLS // 2},
-    {"bar": 0},
-    {"countdown": ("five_hour",)},  # the weekly reset is days out; the 5h one is actionable
-    {"countdown": ()},
-    {"effort": False},
-    {"folder": False},
-    {"model": False},
-    {"context": False},
-)
+def layouts_for(columns):
+    """Choose density for the pane, then shed optional detail if its content is long.
+
+    The account, model, context and every available quota stay in every layout. Width
+    changes remove metadata and abbreviate labels; they never remove a quota or its unit.
+    """
+    wide = columns >= 110
+    return ladder(
+        {"sep": SEP_NARROW if columns >= 50 else "  ",
+         "branch": wide, "folder": wide,
+         "countdown": WINDOWS if wide else ("five_hour",) if columns >= 80 else (),
+         "effort": columns >= 60, "full_account": wide,
+         "model_mode": 0 if wide else 1,
+         "context_compact": False, "compact": columns < 60,
+         "projection": wide},
+        {"branch": False},
+        {"folder": False},
+        {"countdown": ()},
+        {"projection": False},
+        {"effort": False},
+        {"full_account": False, "model_mode": 1},
+        {"compact": True, "sep": " "},
+        {"model_mode": 2, "context_compact": True},
+    )
 
 
 def render(layout, info, now, columns):
     """The status line under `layout`, and whether it fits in `columns`."""
     cells = []
     if layout["folder"]:
-        cells.append(f"{CYAN}{BOLD}{info['folder']}{RESET}")
-    if layout["model"]:
-        model_cell = f"{BLUE}{short_model(info['model'])}{RESET}"
-        if info["effort"] and layout["effort"]:
-            model_cell += f" {DIM}{info['effort']}{RESET}"
-        cells.append(model_cell)
-    if layout["context"]:
-        cells.append(context_cell(info["context"]))
-    for name in info["windows"]:  # 5-hour first, weekly second: the order and units label them
-        cell = window(name, info["usage"].get(name), info["seen"][name], now, layout)
-        cells.append(f"{DIM}wk{RESET} {cell}" if name == "seven_day" and layout["label"] else cell)
+        cells.append(f"{DIM}{info['folder']}{RESET}")
+    model_cell = model_label(info["model"], layout["model_mode"])
+    account = account_label(info.get("account"), layout["full_account"])
+    if account:
+        model_cell = f"{CYAN}{account}{RESET} " + model_cell
+    if info["effort"] and layout["effort"]:
+        effort = info["effort"]
+        if not layout["full_account"]:
+            effort = {"xhigh": "xh", "high": "h", "medium": "m", "low": "l"}.get(effort, effort)
+        model_cell += f" {DIM}{effort}{RESET}"
+    cells.append(model_cell)
+    cells.append(context_cell(info["context"], layout["context_compact"]))
+    for name in info["windows"]:
+        cells.append(window(name, info["usage"].get(name), info["seen"][name], now, layout))
 
     sep = layout["sep"]
     room = columns - printed_width(sep.join(cells))
@@ -967,8 +1110,19 @@ def render(layout, info, now, columns):
         room = min(BRANCH_CELLS, room - printed_width(sep))
         if room < BRANCH_FLOOR:
             return sep.join(cells), False
-        cells.insert(1, f"{MAGENTA}{elide(info['branch'], room)}{RESET}")
+        branch = elide(info["branch"], room)
+        while printed_width(branch) > room and len(branch) > 1:
+            branch = elide(branch, len(branch) - 1)
+        cells.insert(1, f"{DIM}{branch}{RESET}")
     return sep.join(cells), room >= 0
+
+
+def render_status(info, now, columns):
+    for layout in layouts_for(columns):
+        line, fits = render(layout, info, now, columns)
+        if fits:
+            break
+    return line
 
 
 # ------------------------------------------------------------------------------ main
@@ -1040,27 +1194,29 @@ def main():
         payload = {}
 
     now = time.time()
-    stored = read_json(CACHE_PATH)
-    cache = load_cache()
     accounts = read_json(ACCOUNTS_PATH)
-    limits = sub_dict(payload, "rate_limits")
-    account, readings, unidentified = track_session(
-        cache, accounts, payload.get("session_id"), limits, now
-    )
-    if account is None:
-        # No login to attribute anything to -- an API key, or a brand-new token not yet
-        # identified -- so there is no other account's reading to confuse it with, nor
-        # any other reading to be older than.
-        previous, bucket = {}, None
-        usage = blend_into_cache({}, [limits], now)
+    gateway = magpie_state(payload, accounts, now)
+    if gateway is None:
+        stored = read_json(CACHE_PATH)
+        cache = load_cache()
+        limits = sub_dict(payload, "rate_limits")
+        account, readings, unidentified = track_session(
+            cache, accounts, payload.get("session_id"), limits, now
+        )
+        if account is None:
+            # No known login: do not let another account's windows override this one.
+            previous, bucket = {}, None
+            usage = blend_into_cache({}, [limits], now)
+        else:
+            previous = sub_dict(cache["accounts"], account)
+            usage = bucket = blend_into_cache(previous, [anchored(readings, previous, now)], now)
+            cache["accounts"][account] = bucket
+        if cache != stored:
+            write_json(CACHE_PATH, cache)
+        spawn_poll(bucket, unidentified, now)
     else:
-        # `previous` still holds a window that just ran out, which is how a rollover shows.
-        previous = sub_dict(cache["accounts"], account)
-        usage = bucket = blend_into_cache(previous, [anchored(readings, previous, now)], now)
-        cache["accounts"][account] = bucket
-    if cache != stored:
-        write_json(CACHE_PATH, cache)
-    spawn_poll(bucket, unidentified, now)
+        account, previous, bucket, limits = None, {}, None, {}
+        usage = gateway["usage"]
 
     cwd = sub_dict(payload, "workspace").get("current_dir") or payload.get("cwd") or os.getcwd()
     cwd = cwd.rstrip("/") if isinstance(cwd, str) else os.getcwd()
@@ -1076,28 +1232,28 @@ def main():
         for name in WINDOWS
         if not (name == "five_hour" and no_session_limit and "resets_at" not in usage.get(name, {}))
     ]
+    if gateway is not None:
+        model = gateway["model"] or model
+        effort = gateway["effort"] or effort
+        shown = gateway["windows"]
 
     info = {
         "folder": os.path.basename(cwd),
         "branch": git_branch(cwd),
         "model": model,
+        "account": gateway["account"] if gateway is not None else account_name(accounts, account),
         "effort": effort,
         "context": context,
         "windows": shown,
         # An idle window shows the same as one that just ran out: nothing spent since.
         "usage": {name: usage[name] for name in WINDOWS if "resets_at" in usage.get(name, {})},
-        "seen": {
+        "seen": gateway["seen"] if gateway is not None else {
             name: name in usage or any(normalize(c.get(name)) for c in (limits, previous))
             for name in WINDOWS
         },
     }
     columns = terminal_columns()
-    # Nothing fitting at all leaves the sparsest line, for Claude Code to cut as it must.
-    for layout in LAYOUTS:
-        line, fits = render(layout, info, now, columns)
-        if fits:
-            break
-    sys.stdout.write(line)
+    sys.stdout.write(render_status(info, now, columns))
 
 
 if __name__ == "__main__":
