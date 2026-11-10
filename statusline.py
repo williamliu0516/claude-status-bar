@@ -55,7 +55,8 @@ Which account that is
 ---------------------
 Not the one in ~/.claude.json. That file is shared by every Claude Code process on the
 machine, but the login each one uses depends on where it runs: Claude Code reads
-CLAUDE_CODE_OAUTH_TOKEN, then the Keychain, then ~/.claude/.credentials.json, and a process
+CLAUDE_CODE_OAUTH_TOKEN, then the Keychain, then ~/.claude/.credentials.json (both moved by
+CLAUDE_CONFIG_DIR, see `login_location`), and a process
 that cannot reach the login Keychain -- every pane of a tmux server started over ssh or
 mosh -- is refused and falls through to the file. So one Mac can bill two accounts at once,
 one for the windows on its own screen and one for everything inside that tmux, while
@@ -106,8 +107,28 @@ ANSI = re.compile(r"\033\[[0-9;]*m")
 CACHE_PATH = os.path.expanduser("~/.claude/statusline-usage.json")
 LOCK_PATH = CACHE_PATH + ".lock"
 ACCOUNTS_PATH = os.path.expanduser("~/.claude/statusline-accounts.json")
-CREDENTIALS_PATH = os.path.expanduser("~/.claude/.credentials.json")
-KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+
+def login_location():
+    """Where this session's Claude Code keeps its login: (Keychain service, credentials file).
+
+    CLAUDE_CONFIG_DIR gives a second login its own home (`alias work='CLAUDE_CONFIG_DIR=~/.claude-work claude'`).
+    Claude Code then files the token under "Claude Code-credentials-<first 8 hex of the
+    SHA-256 of that path>" and writes .credentials.json inside it; reading the default
+    entry instead would credit every such session to the default login. The variable is
+    inherited by the status line, so each session resolves its own.
+    """
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not config_dir:
+        return "Claude Code-credentials", os.path.expanduser("~/.claude/.credentials.json")
+    import hashlib
+
+    suffix = hashlib.sha256(config_dir.encode()).hexdigest()[:8]
+    return (f"Claude Code-credentials-{suffix}",
+            os.path.join(os.path.expanduser(config_dir), ".credentials.json"))
+
+
+KEYCHAIN_SERVICE, CREDENTIALS_PATH = login_location()
 SETTINGS_PATH = os.path.expanduser("~/.claude/settings.json")
 INSTALL_PATH = os.path.expanduser("~/.claude/statusline.py")
 MAGPIE_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "magpie")
@@ -298,7 +319,7 @@ def token_key(token):
     return hashlib.sha256(token.encode()).hexdigest()[:16]
 
 
-def account_label(profile):
+def profile_label(profile):
     """`personal` for an individual plan, else the organization's own name.
 
     Claude.ai gives each individual subscriber an organization named "<email>'s
@@ -593,7 +614,7 @@ def stored_login():
     """The OAuth login Claude Code would use from this process's context, or {}.
 
     Claude Code's own order: CLAUDE_CODE_OAUTH_TOKEN, then on macOS the Keychain, then
-    ~/.claude/.credentials.json. Where this runs decides the answer -- a security session
+    .credentials.json, each for this session's config dir (`login_location`). Where this runs decides the answer -- a security session
     that cannot reach the login Keychain gets exit 36 and falls through to the file, which
     Claude Code wrote the last time it was in the same position, often for another account.
     The status line runs as a child of its session, so it lands where its session does.
@@ -671,7 +692,7 @@ def identify(token, now):
     newest = sorted(tokens.items(), key=lambda item: item[1]["seen"])[-MAX_TOKENS:]
     accounts["tokens"] = dict(newest)
     people = sub_dict(accounts, "accounts")
-    people[uuid] = {"label": account_label(profile), "email": account.get("email")}
+    people[uuid] = {"label": profile_label(profile), "email": account.get("email")}
     accounts["accounts"] = people
     write_json(ACCOUNTS_PATH, accounts)
     return uuid
